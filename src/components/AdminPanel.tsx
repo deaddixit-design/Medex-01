@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Trash2, Plus, Sparkles, Image, List, ShieldAlert, LogOut, UserPlus, Key, User, CheckCircle2, XCircle, X, FileSpreadsheet, RefreshCw, Settings, Copy, Check, Eye, EyeOff, ExternalLink, MessageSquare, Phone, Music, Video, Edit, Link as LinkIcon, Flame, Disc, Play, GraduationCap, BookOpen, Beaker, FileText, Layers, Activity, ChevronLeft, ChevronRight, Presentation, Newspaper, HelpCircle, Microscope } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { MedexLogo } from './logo.webp';
+import { MedexLogo } from './Medexlogo';
 
 // Local fetch wrapper to ensure cookies/credentials are always passed in sandboxes
 const fetch = (input: RequestInfo | URL, init?: RequestInit) => {
