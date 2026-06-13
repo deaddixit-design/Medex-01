@@ -7,17 +7,17 @@ import { useProgram } from '../lib/ProgramContext';
 
 const defaultSlides: { image: string; title: string; subtitle: string; isProgram?: boolean }[] = [
   {
-    image: '/Hero%2002.png',
+    image: '/Hero%2001.wbep',
     title: 'Unleash Your Creativity',
     subtitle: 'Share your ideas and shape the future of our college events.',
   },
   {
-    image: '/Hero%2003.png',
+    image: '/Hero%2002.wbep',
     title: 'Showcase Your Talent',
     subtitle: 'Upload your media and get featured in our annual showcase.',
   },
   {
-    image: '/Hero%2004.png',
+    image: '/Hero%2003.wbep',
     title: 'Experience the Pulse',
     subtitle: 'Join the community and witness the best performances of the year.',
   },
@@ -56,33 +56,33 @@ export function HeroSlider() {
       isProgram: true
     },
     {
-      image: customSettings.home_image_1 || 'Hero%2002.png',
+      image: customSettings.home_image_1 || 'Hero%2001.wbep',
       title: 'Unleash Your Creativity',
       subtitle: 'Share your ideas and shape the future of our college events.',
     },
     {
-      image: customSettings.home_image_2 || 'Hero%2003.png',
+      image: customSettings.home_image_2 || 'Hero%2002.wbep',
       title: 'Showcase Your Talent',
       subtitle: 'Upload your media and get featured in our annual showcase.',
     },
     {
-      image: customSettings.home_image_3 || 'Hero%2004.png',
+      image: customSettings.home_image_3 || 'Hero%2003.wbep',
       title: 'Experience the Pulse',
       subtitle: 'Join the community and witness the best performances of the year.',
     },
   ] : [
     {
-      image: customSettings.home_image_1 || 'Hero%2002.png',
+      image: customSettings.home_image_1 || 'Hero%2001.wbep',
       title: 'Unleash Your Creativity',
       subtitle: 'Share your ideas and shape the future of our college events.',
     },
     {
-      image: customSettings.home_image_2 || 'Hero%2003.png',
+      image: customSettings.home_image_2 || 'Hero%2002.wbep',
       title: 'Showcase Your Talent',
       subtitle: 'Upload your media and get featured in our annual showcase.',
     },
     {
-      image: customSettings.home_image_3 || 'Hero%2004.png',
+      image: customSettings.home_image_3 || 'Hero%2003.wbep',
       title: 'Experience the Pulse',
       subtitle: 'Join the community and witness the best performances of the year.',
     },
