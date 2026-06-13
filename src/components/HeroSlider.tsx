@@ -56,19 +56,19 @@ export function HeroSlider() {
       isProgram: true
     },
     {
-      image: customSettings.home_image_1 || 'https://picsum.photos/seed/college_event_1/1920/1080',
-      title: 'Unleash Your Creativity',
-      subtitle: 'Share your ideas and shape the future of our college events.',
+      image: customSettings.home_image_1 || 'Hero%2001.webp',
+      title: 'Providing free materials',
+      subtitle: 'Do not get tensed about the materials .',
     },
     {
-      image: customSettings.home_image_2 || 'https://picsum.photos/seed/college_event_2/1920/1080',
-      title: 'Showcase Your Talent',
-      subtitle: 'Upload your media and get featured in our annual showcase.',
+      image: customSettings.home_image_2 || 'Hero%2002.webp',
+      title: 'Use latest tech in our site',
+      subtitle: 'challenge yourself with rewards.',
     },
     {
-      image: customSettings.home_image_3 || 'https://picsum.photos/seed/college_event_3/1920/1080',
-      title: 'Experience the Pulse',
-      subtitle: 'Join the community and witness the best performances of the year.',
+      image: customSettings.home_image_3 || 'Hero%2003.webp',
+      title: 'Verified Books',
+      subtitle: 'join MEDex today.',
     },
   ] : [
     {
