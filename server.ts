@@ -1,10 +1,10 @@
-﻿import 'dotenv/config';
+import 'dotenv/config';
 import express from 'express';
-import pg from 'pg';
+import Database from 'better-sqlite3';
 import path from 'path';
 import session from 'express-session';
 import bcrypt from 'bcryptjs';
-import connectPgSimple from 'connect-pg-simple';
+import sqlite3 from 'connect-sqlite3';
 import cors from 'cors';
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
@@ -13,93 +13,1045 @@ import fs from 'fs';
 import { GoogleGenAI, Type } from '@google/genai';
 import officeParser from 'officeparser';
 
-const PgSessionStore = connectPgSimple(session);
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, setDoc } from 'firebase/firestore';
 
+const SQLiteStore = sqlite3(session);
 
-const { Pool } = pg;
-const dbUrl = process.env.DATABASE_URL;
-
-if (!dbUrl) {
-  console.error("FATAL ERROR: DATABASE_URL environment variable is not defined!");
+const dbPath = process.env.DATABASE_PATH || 'campus_pulse.db';
+const dbDir = path.dirname(dbPath);
+if (dbDir !== '.' && dbDir !== '/' && !fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
 }
 
-const pool = new Pool({
-  connectionString: dbUrl || 'postgresql://postgres:postgres@localhost:5432/postgres',
-  ssl: dbUrl ? { rejectUnauthorized: false } : false
-});
+// Initialize Firestore on Backend
+const firebaseConfigPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+let firestoreDb: any = null;
 
-class Statement {
-  private sql: string;
-  constructor(sql: string) {
-    this.sql = this.translateSql(sql);
+if (fs.existsSync(firebaseConfigPath)) {
+  try {
+    const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf8'));
+    const firebaseApp = initializeApp(firebaseConfig);
+    firestoreDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+    console.log('[Firestore Sync] Firebase and Firestore successfully initialized on the backend.');
+  } catch (err) {
+    console.error('[Firestore Sync] Failed to initialize Firebase on server:', err);
+  }
+} else {
+  console.warn('[Firestore Sync] firebase-applet-config.json not found in root.');
+}
+
+const CHUNK_SIZE = 800 * 1024; // 800 KB
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: null,
+      email: null,
+      emailVerified: null,
+      isAnonymous: null,
+      tenantId: null,
+      providerInfo: []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// Asynchronous restore function
+async function restoreDatabase() {
+  if (!firestoreDb) {
+    console.warn('[Firestore Sync] Firestore not initialized, skipping restore.');
+    return;
+  }
+  
+  const pathForGet = 'db_backup/metadata';
+  let metaDoc;
+  try {
+    metaDoc = await getDoc(doc(firestoreDb, 'db_backup', 'metadata'));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, pathForGet);
+    return;
   }
 
-  private translateSql(sql: string): string {
-    let translated = sql;
-    let paramIndex = 1;
-    translated = translated.replace(/\?/g, () => `$${paramIndex++}`);
-    
-    if (translated.toUpperCase().includes('INSERT OR IGNORE INTO ACADEMIC_SESSIONS')) {
-      translated = translated.replace(/INSERT OR IGNORE INTO academic_sessions \((.*?)\) VALUES \((.*?)\)/i, 
-        'INSERT INTO academic_sessions ($1) VALUES ($2) ON CONFLICT (name) DO NOTHING');
+  if (!metaDoc.exists()) {
+    console.log('[Firestore Sync] No database backup found in Firestore. Starting with local file/creation.');
+    return;
+  }
+  const dataMeta = metaDoc.data();
+  if (!dataMeta || typeof dataMeta.totalChunks !== 'number') {
+    console.warn('[Firestore Sync] Invalid metadata format in Firestore.');
+    return;
+  }
+  const { totalChunks, totalSize } = dataMeta;
+  console.log(`[Firestore Sync] Restoring database of size ${totalSize} bytes from ${totalChunks} chunks...`);
+  
+  const chunks: Buffer[] = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkPath = `db_backup/chunk_${i}`;
+    let cDoc;
+    try {
+      cDoc = await getDoc(doc(firestoreDb, 'db_backup', `chunk_${i}`));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, chunkPath);
+      return;
     }
-    if (translated.toUpperCase().includes('INSERT OR IGNORE INTO MEMORY_BATCHES')) {
-      translated = translated.replace(/INSERT OR IGNORE INTO memory_batches \((.*?)\) VALUES \((.*?)\)/i, 
-        'INSERT INTO memory_batches ($1) VALUES ($2) ON CONFLICT (name) DO NOTHING');
-    }
-    if (translated.toUpperCase().includes('INSERT OR REPLACE INTO SETTINGS')) {
-      translated = translated.replace(/INSERT OR REPLACE INTO settings \((.*?)\) VALUES \((.*?)\)/i, 
-        'INSERT INTO settings ($1) VALUES ($2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value');
-    }
-    
-    translated = translated.replace(/INSERT OR IGNORE INTO/gi, 'INSERT INTO');
-    translated = translated.replace(/INSERT OR REPLACE INTO/gi, 'INSERT INTO');
 
-    if (translated.trim().toUpperCase().startsWith('INSERT ') && !translated.toUpperCase().includes('RETURNING ')) {
-      translated = translated.trim();
-      if (translated.endsWith(';')) {
-        translated = translated.slice(0, -1);
+    if (!cDoc.exists()) {
+      console.error(`[Firestore Sync] Missing chunk_${i} in Firestore. Aborting restore.`);
+      return;
+    }
+    const cData = cDoc.data();
+    if (!cData || typeof cData.data !== 'string') {
+      console.error(`[Firestore Sync] Invalid data in chunk_${i}. Aborting restore.`);
+      return;
+    }
+    chunks.push(Buffer.from(cData.data, 'base64'));
+  }
+  
+  const dbBuffer = Buffer.concat(chunks);
+  fs.writeFileSync(dbPath, dbBuffer);
+  console.log(`[Firestore Sync] SQLite database file successfully restored to ${dbPath} (${dbBuffer.length} bytes).`);
+}
+
+let db: any;
+
+let lastBackupMtime = 0;
+if (fs.existsSync(dbPath)) {
+  lastBackupMtime = fs.statSync(dbPath).mtimeMs;
+}
+
+// Asynchronous backup function
+async function backupDatabase() {
+  if (!firestoreDb) return;
+  if (!fs.existsSync(dbPath)) return;
+  
+  try {
+    const stats = fs.statSync(dbPath);
+    const mtime = stats.mtimeMs;
+    
+    // Skip if nothing changed
+    if (mtime <= lastBackupMtime) {
+      return;
+    }
+    
+    const fileBuffer = fs.readFileSync(dbPath);
+    const size = fileBuffer.length;
+    const totalChunks = Math.ceil(size / CHUNK_SIZE);
+    
+    console.log(`[Firestore Sync] Backing up database (${size} bytes) in ${totalChunks} chunks to Firestore...`);
+    
+    try {
+      await setDoc(doc(firestoreDb, 'db_backup', 'metadata'), {
+        totalSize: size,
+        totalChunks,
+        updatedAt: new Date().toISOString()
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'db_backup/metadata');
+    }
+    
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, size);
+      const chunk = fileBuffer.subarray(start, end);
+      try {
+        await setDoc(doc(firestoreDb, 'db_backup', `chunk_${i}`), {
+          chunkIndex: i,
+          data: chunk.toString('base64')
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `db_backup/chunk_${i}`);
       }
-      translated += ' RETURNING id';
     }
-    return translated;
-  }
-
-  async all(...params: any[]): Promise<any[]> {
-    const actualParams = params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
-    const res = await pool.query(this.sql, actualParams);
-    return res.rows;
-  }
-
-  async get(...params: any[]): Promise<any> {
-    const actualParams = params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
-    const res = await pool.query(this.sql, actualParams);
-    return res.rows[0];
-  }
-
-  async run(...params: any[]): Promise<{ lastInsertRowid: number | null, changes: number }> {
-    const actualParams = params.length === 1 && Array.isArray(params[0]) ? params[0] : params;
-    const res = await pool.query(this.sql, actualParams);
-    const lastInsertRowid = res.rows[0]?.id || null;
-    return {
-      lastInsertRowid: lastInsertRowid ? Number(lastInsertRowid) : null,
-      changes: res.rowCount || 0
-    };
+    
+    lastBackupMtime = mtime;
+    console.log('[Firestore Sync] Backup completed successfully.');
+  } catch (err) {
+    console.error('[Firestore Sync] Error during backup:', err);
   }
 }
 
-const db = {
-  prepare(sql: string) {
-    return new Statement(sql);
-  },
-  async exec(sql: string) {
-    await pool.query(sql);
-  },
-  close() {
-    return pool.end();
+// Start auto-backup background interval checking for changes every 5 seconds
+if (firestoreDb) {
+  setInterval(() => {
+    backupDatabase().catch(err => {
+      console.error('[Firestore Sync] Auto-backup interval error:', err);
+    });
+  }, 5000);
+  
+  // Also backup when the process exits
+  process.on('SIGINT', async () => {
+    console.log('[Firestore Sync] SIGINT received. Running final database backup...');
+    await backupDatabase();
+    process.exit(0);
+  });
+  
+  process.on('SIGTERM', async () => {
+    console.log('[Firestore Sync] SIGTERM received. Running final database backup...');
+    await backupDatabase();
+    process.exit(0);
+  });
+}
+
+// Initialize Database
+function initDbAndMigrations() {
+db.exec(`
+  CREATE TABLE IF NOT EXISTS media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    type TEXT CHECK(type IN ('photo', 'video')) NOT NULL,
+    year INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS performances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    performer TEXT NOT NULL,
+    time TEXT NOT NULL DEFAULT '19:00',
+    is_approved INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS admins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS demanding_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL, -- 'song', 'videography', 'photography'
+    title TEXT NOT NULL,
+    link TEXT NOT NULL,
+    description TEXT,
+    category TEXT DEFAULT 'Trending',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS batch_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    type TEXT CHECK(type IN ('photo', 'video')) NOT NULL,
+    uploaded_by TEXT DEFAULT 'Anonymous',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS memory_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS content_subjects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    logo TEXT NOT NULL DEFAULT 'BookOpen',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS content_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(subject_id) REFERENCES content_subjects(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS content_articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id INTEGER NULL,
+    subject_id INTEGER NULL,
+    section TEXT DEFAULT 'textbook',
+    headline TEXT NOT NULL,
+    content TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    file_path TEXT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_ai_generated INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS standalone_books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    author_name TEXT NOT NULL DEFAULT 'BMLT Director',
+    cover_color TEXT NOT NULL DEFAULT 'teal',
+    allow_download INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS book_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    author_name TEXT NOT NULL DEFAULT 'BMLT Scholar',
+    allow_download INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(book_id) REFERENCES standalone_books(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS news_updates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    author_name TEXT NOT NULL DEFAULT 'Admin',
+    category TEXT DEFAULT 'General',
+    image_url TEXT NULL,
+    file_path TEXT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS mcqs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id INTEGER NULL,
+    topic_id INTEGER NULL,
+    question TEXT NOT NULL,
+    option_a TEXT NOT NULL,
+    option_b TEXT NOT NULL,
+    option_c TEXT NULL,
+    option_d TEXT NULL,
+    option_e TEXT NULL,
+    correct_option TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+`);
+
+// Migrate tables to include allow_download if they exist
+try {
+  db.prepare("ALTER TABLE standalone_books ADD COLUMN allow_download INTEGER DEFAULT 1").run();
+} catch (e) {}
+
+try {
+  db.prepare("ALTER TABLE book_documents ADD COLUMN allow_download INTEGER DEFAULT 1").run();
+} catch (e) {}
+
+try {
+  db.prepare("ALTER TABLE content_articles ADD COLUMN allow_download INTEGER DEFAULT 1").run();
+} catch (e) {}
+
+// Migrate content_articles to support subject-level direct textbooks and notes as well as files
+try {
+  db.prepare("ALTER TABLE content_articles ADD COLUMN subject_id INTEGER").run();
+} catch (e) {}
+
+try {
+  db.prepare("ALTER TABLE content_articles ADD COLUMN section TEXT DEFAULT 'textbook'").run();
+} catch (e) {}
+
+try {
+  db.prepare("ALTER TABLE content_articles ADD COLUMN file_path TEXT").run();
+} catch (e) {}
+
+try {
+  db.prepare("ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'admin'").run();
+} catch (e) {}
+
+// Initialize Custom BMLT Desk Tables for specialized MCQs and Case Studies
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS bmlt_mcqs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      question TEXT NOT NULL,
+      option_a TEXT NOT NULL,
+      option_b TEXT NOT NULL,
+      option_c TEXT NULL,
+      option_d TEXT NULL,
+      correct_option TEXT NOT NULL,
+      image_url TEXT NULL,
+      explanation TEXT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+} catch (e) {}
+
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS bmlt_case_studies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      presentation TEXT NOT NULL,
+      type TEXT NOT NULL,
+      question TEXT NOT NULL,
+      option_a TEXT NULL,
+      option_b TEXT NULL,
+      option_c TEXT NULL,
+      option_d TEXT NULL,
+      correct_option TEXT NULL,
+      correct_guidelines TEXT NULL,
+      normal_params TEXT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+} catch (e) {}
+
+try {
+  db.prepare(`ALTER TABLE bmlt_case_studies ADD COLUMN normal_params TEXT NULL`).run();
+} catch (e) {}
+
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS bmlt_slides (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      target_cell TEXT NOT NULL,
+      hint TEXT NOT NULL,
+      image_url TEXT NOT NULL,
+      fact TEXT NOT NULL,
+      options TEXT NOT NULL,
+      hotspots TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+} catch (e) {
+  console.error("Error creating bmlt_slides table:", e);
+}
+
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS bmlt_lab_params (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      unit TEXT NOT NULL,
+      normal_min_male REAL NOT NULL,
+      normal_max_male REAL NOT NULL,
+      normal_min_female REAL NOT NULL,
+      normal_max_female REAL NOT NULL,
+      category TEXT NOT NULL,
+      description TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+} catch (e) {
+  console.error("Error creating bmlt_lab_params table:", e);
+}
+
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS students (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      roll_no TEXT NOT NULL UNIQUE,
+      reg_no TEXT NOT NULL UNIQUE,
+      points INTEGER DEFAULT 0,
+      profile_pic TEXT NULL,
+      correct_mcq_ids TEXT DEFAULT '[]',
+      correct_bmlt_mcq_ids TEXT DEFAULT '[]',
+      correct_bmlt_slide_ids TEXT DEFAULT '[]',
+      correct_bmlt_case_ids TEXT DEFAULT '[]',
+      correct_bmlt_case_paragraph_ids TEXT DEFAULT '[]',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+  try {
+    db.prepare(`ALTER TABLE students ADD COLUMN session TEXT DEFAULT '2023-2026'`).run();
+  } catch (e) {}
+  try {
+    db.prepare(`ALTER TABLE students ADD COLUMN section TEXT DEFAULT 'A'`).run();
+  } catch (e) {}
+  try {
+    db.prepare(`ALTER TABLE students ADD COLUMN correct_bmlt_slide_ids TEXT DEFAULT '[]'`).run();
+  } catch (e) {}
+  try {
+    db.prepare(`ALTER TABLE students ADD COLUMN correct_bmlt_case_ids TEXT DEFAULT '[]'`).run();
+  } catch (e) {}
+  try {
+    db.prepare(`ALTER TABLE students ADD COLUMN correct_bmlt_case_paragraph_ids TEXT DEFAULT '[]'`).run();
+  } catch (e) {}
+} catch (e) {
+  console.error("Error creating students table:", e);
+}
+
+try {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS academic_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+  
+  const countSessions = (db.prepare('SELECT COUNT(*) as cnt FROM academic_sessions').get() as { cnt: number }).cnt;
+  if (countSessions === 0) {
+    const defaultSessions = ['2022-2025', '2023-2026', '2024-2027', '2025-2028'];
+    const insert = db.prepare('INSERT OR IGNORE INTO academic_sessions (name) VALUES (?)');
+    for (const sess of defaultSessions) {
+      insert.run(sess);
+    }
   }
-};
+} catch (e) {
+  console.error("Error creating academic_sessions table:", e);
+}
+
+try {
+  const countMcqs = (db.prepare('SELECT COUNT(*) as cnt FROM bmlt_mcqs').get() as { cnt: number }).cnt;
+  if (countMcqs === 0) {
+    db.prepare(`
+      INSERT INTO bmlt_mcqs (question, option_a, option_b, option_c, option_d, correct_option, image_url, explanation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Identify the abnormal erythrocyte shape displaying a "bullseye" central condensation of hemoglobin surrounded by a clear ring under blood smear:',
+      'Spherocyte',
+      'Target Cell (Codocyte)',
+      'Schistocyte',
+      'Sickle Cell (Drepanocyte)',
+      'B',
+      'https://images.unsplash.com/photo-1614850523011-8f49fc9ec67a?auto=format&fit=crop&q=80&w=600',
+      'Target cells (codocytes) show a characteristic "bullseye" pattern. They are commonly seen in liver disease, thalassemia, and iron deficiency.'
+    );
+    
+    db.prepare(`
+      INSERT INTO bmlt_mcqs (question, option_a, option_b, option_c, option_d, correct_option, image_url, explanation)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'An elevated level of which granulocytic leukocyte is specifically indicative of a parasitic infection or allergic reaction in a clinical laboratory count?',
+      'Neutrophils',
+      'Lymphocytes',
+      'Eosinophils',
+      'Basophils',
+      'C',
+      'https://images.unsplash.com/photo-1579161748255-33b3fc535f26?auto=format&fit=crop&q=80&w=600',
+      'Eosinophils are granular leukocytes whose primary role includes fighting off multi-cellular parasites and moderating allergic triggers.'
+    );
+  }
+} catch (e) {
+  console.error("Error seeding bmlt_mcqs:", e);
+}
+
+try {
+  const countCases = (db.prepare('SELECT COUNT(*) as cnt FROM bmlt_case_studies').get() as { cnt: number }).cnt;
+  if (countCases === 0) {
+    db.prepare(`
+      INSERT INTO bmlt_case_studies (title, presentation, type, question, option_a, option_b, option_c, option_d, correct_option, correct_guidelines)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Case of the Fatigued Scholar',
+      'A 20-year-old student reports progressive fatigue, breathlessness on climbing stairs, and brittle nails over the semester. Lab values show microcytic, hypochromic erythrocytes on PBS, with Hemoglobin hovering at 8.2 g/dL. Serum Ferritin is low (7 ng/mL) and TIBC is high (450 mcg/dL).',
+      'mcq',
+      'Based on these diagnostic biomarkers, what microcytic anemia is represented?',
+      'Iron Deficiency Anemia',
+      'Beta Thalassemia Minor',
+      'Aplastic Anemia',
+      'Megaloblastic Anemia',
+      'A',
+      null
+    );
+
+    db.prepare(`
+      INSERT INTO bmlt_case_studies (title, presentation, type, question, option_a, option_b, option_c, option_d, correct_option, correct_guidelines)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Acute Renal Stress Investigation',
+      'A 62-year-old patient with long-term hypertension presents with sudden swelling in both legs, diminished urine volume, and a feeling of nausea. Lab tests confirm Serum Creatinine is extremely high at 4.2 mg/dL, and Blood Urea Nitrogen (BUN) is 85 mg/dL.',
+      'paragraph',
+      'Evaluate the patient condition. Explain the significance of the elevated Creatinine and BUN and name the likely clinical syndrome.',
+      null,
+      null,
+      null,
+      null,
+      null,
+      'Acute Kidney Injury (AKI), renal failure, impaired GFR filtration, elevated waste products, diminished clearance'
+    );
+  }
+} catch (e) {
+  console.error("Error seeding bmlt_case_studies:", e);
+}
+
+try {
+  const countSlides = (db.prepare('SELECT COUNT(*) as cnt FROM bmlt_slides').get() as { cnt: number }).cnt;
+  if (countSlides === 0) {
+    db.prepare(`
+      INSERT INTO bmlt_slides (name, description, target_cell, hint, image_url, fact, options, hotspots)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Normal Blood Smear - Polymorphonuclear Neutrophil',
+      'Notice the multi-lobed nucleus (usually 3 to 5 lobes joined by thin strands) and fine, lilac-pink granules in the cytoplasm.',
+      'Neutrophil',
+      'Multi-lobed nucleus with neutral cytoplasm granules, crucial for immune defense.',
+      'https://upload.wikimedia.org/wikipedia/commons/e/e5/Segmented_neutrophil.jpg',
+      'Neutrophils are the most abundant type of granulocytes, making up 40% to 70% of all white blood cells in humans.',
+      'Neutrophil,Eosinophil,Lymphocyte,Monocyte',
+      JSON.stringify([
+        { x: 50, y: 50, name: 'Normal Multi-lobed Nucleus', description: 'Classic polymorphonuclear clumped chromatin showing 3 distinct connected nuclear lobes.' },
+        { x: 38, y: 64, name: 'Neutral Cytoplasmic Granules', description: 'Extremely fine, dusty pink-lilac neutrophilic lysosomal granules suspended in neutral cytoplasm.' },
+        { x: 22, y: 35, name: 'Normal Biconcave Erythrocyte', description: 'A perfect biconcave discocyte showing ideal 1/3 circular central pallor of normal hemoglobin saturation.' },
+        { x: 74, y: 72, name: 'Extracellular Platelet (Thrombocyte)', description: 'Small, 2-3 micron non-nucleated cytoplasmic fragment showing purple granule cores.' }
+      ])
+    );
+
+    db.prepare(`
+      INSERT INTO bmlt_slides (name, description, target_cell, hint, image_url, fact, options, hotspots)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Peripheral Blood Smear - Plasmodium falciparum (Ring Form)',
+      'Look carefully inside the red blood cells. You will see delicate blue cytoplasmic rings with bright red chromatin dots resembling a signet-ring.',
+      'Plasmodium falciparum',
+      'A signet-ring shape inside erythrocyte cytoplasm. Causes malaria.',
+      'https://upload.wikimedia.org/wikipedia/commons/c/c5/Plasmodium_falciparum_ring_forms_smear_9157_lores.jpg',
+      'Plasmodium falciparum represents the most dangerous species of malaria parasite, causing cerebral symptoms.',
+      'Plasmodium falciparum,Trypanosoma,Leishmania donovani,Babesia',
+      JSON.stringify([
+        { x: 42, y: 48, name: 'Plasmodium Ring Form (Trophozoite)', description: 'Early rings with high-contrast red chromatin bead and thin blue cytoplasmic ring loop.' },
+        { x: 67, y: 34, name: 'Double Infection Ring Host', description: 'Erythrocyte containing multiple parasite rings, heavily suggestive of high-density P. falciparum loads.' },
+        { x: 30, y: 72, name: 'Normal Uninfected Red Blood Cell', description: 'Standard healthy discocyte serving as morphologic size reference (approx 7 microns).' }
+      ])
+    );
+
+    db.prepare(`
+      INSERT INTO bmlt_slides (name, description, target_cell, hint, image_url, fact, options, hotspots)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Erythrocyte Pathology - Sickle Cell Anemia (Drepanocytes)',
+      'Look for elongated, crescent-shaped or sickle-like erythrocytes with pointed ends caused by mutated Hemoglobin S polymer chains under hypoxia.',
+      'Sickle Cell',
+      'Crescent or banana-shaped erythrocytes causing vascular occlusion.',
+      'https://upload.wikimedia.org/wikipedia/commons/a/af/Sickle_cell_anemia_smear.jpg',
+      'A single amino acid substitution (valine for glutamic acid at position 6 of the beta-globin chain) is the root genetic cause.',
+      'Sickle Cell,Target Cell,Spherocyte,Schistocyte',
+      JSON.stringify([
+        { x: 48, y: 58, name: 'Classic Drepanocyte (Sickle Erythrocyte)', description: 'Rigid, crescent-shaped cell with sharp pointed ends, formed by polymerized mutant HbS tactile chains.' },
+        { x: 32, y: 28, name: 'Normal Discocyte RBC', description: 'Standard healthy biconcave erythrocyte unaffected by sickling triggers.' },
+        { x: 68, y: 42, name: 'Target Cell (Codocyte)', description: 'Erythrocyte featuring a target board central ring due to increased membrane surface area relative to hemoglobin content.' }
+      ])
+    );
+  }
+} catch (e) {
+  console.error("Error seeding bmlt_slides:", e);
+}
+
+try {
+  const countParams = (db.prepare('SELECT COUNT(*) as cnt FROM bmlt_lab_params').get() as { cnt: number }).cnt;
+  if (countParams === 0) {
+    const list = [
+      { name: 'Hemoglobin (Hb)', unit: 'g/dL', normalMinMale: 13.5, normalMaxMale: 17.5, normalMinFemale: 12.0, normalMaxFemale: 15.5, category: 'Hematology', description: 'Oxygen-carrying protein in red blood cells.' },
+      { name: 'Total WBC Count', unit: 'cells/cu.mm', normalMinMale: 4000, normalMaxMale: 11000, normalMinFemale: 4000, normalMaxFemale: 11000, category: 'Hematology', description: 'White blood cells count. Key indicator of systemic infection.' },
+      { name: 'Platelet Count', unit: 'Lakhs/cu.mm', normalMinMale: 1.5, normalMaxMale: 4.5, normalMinFemale: 1.5, normalMaxFemale: 4.5, category: 'Hematology', description: 'Crucial element involved in cellular blood coagulation.' },
+      { name: 'Serum Bilirubin (Total)', unit: 'mg/dL', normalMinMale: 0.2, normalMaxMale: 1.2, normalMinFemale: 0.2, normalMaxFemale: 1.2, category: 'Biochemistry', description: 'Heme degradation byproduct. Elevated levels indicate Jaundice or Hepatic dysfunction.' },
+      { name: 'Fasting Blood Glucose', unit: 'mg/dL', normalMinMale: 70, normalMaxMale: 100, normalMinFemale: 70, normalMaxFemale: 100, category: 'Biochemistry', description: 'Blood sugar density. Primary benchmark for diabetes screening.' },
+      { name: 'Serum Creatinine', unit: 'mg/dL', normalMinMale: 0.7, normalMaxMale: 1.3, normalMinFemale: 0.6, normalMaxFemale: 1.1, category: 'Biochemistry', description: 'Muscle creatinine breakdown waste filtered by kidneys. Serves as kidney health check.' }
+    ];
+    for (const item of list) {
+      db.prepare(`
+        INSERT INTO bmlt_lab_params (name, unit, normal_min_male, normal_max_male, normal_min_female, normal_max_female, category, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(item.name, item.unit, item.normalMinMale, item.normalMaxMale, item.normalMinFemale, item.normalMaxFemale, item.category, item.description);
+    }
+  }
+} catch (e) {
+  console.error("Error seeding bmlt_lab_params:", e);
+}
+
+// Ensure topic_id is nullable (SQLite migration)
+try {
+  const tableInfo = db.prepare("PRAGMA table_info(content_articles)").all() as Array<{
+    cid: number;
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: any;
+    pk: number;
+  }>;
+  const topicIdCol = tableInfo.find(col => col.name === 'topic_id');
+  if (topicIdCol && topicIdCol.notnull === 1) {
+    console.log("Migrating table content_articles to make topic_id nullable...");
+    db.transaction(() => {
+      // 1. Rename existing table
+      db.prepare("ALTER TABLE content_articles RENAME TO content_articles_old").run();
+
+      // 2. Create the new table with nullable topic_id
+      db.prepare(`
+        CREATE TABLE content_articles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          topic_id INTEGER NULL,
+          subject_id INTEGER NULL,
+          section TEXT DEFAULT 'textbook',
+          headline TEXT NOT NULL,
+          content TEXT NOT NULL,
+          author_name TEXT NOT NULL,
+          file_path TEXT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          is_ai_generated INTEGER DEFAULT 0
+        );
+      `).run();
+
+      // 3. Detect which columns exist in content_articles_old to copy them safely
+      const oldCols = db.prepare("PRAGMA table_info(content_articles_old)").all() as Array<{ name: string }>;
+      const oldColNames = oldCols.map(c => c.name);
+      
+      const colsToCopy = ['id', 'topic_id', 'headline', 'content', 'author_name', 'created_at', 'is_ai_generated'];
+      if (oldColNames.includes('subject_id')) colsToCopy.push('subject_id');
+      if (oldColNames.includes('section')) colsToCopy.push('section');
+      if (oldColNames.includes('file_path')) colsToCopy.push('file_path');
+
+      const colsStr = colsToCopy.join(', ');
+      db.prepare(`
+        INSERT INTO content_articles (${colsStr})
+        SELECT ${colsStr} FROM content_articles_old
+      `).run();
+
+      // 4. Drop the old table
+      db.prepare("DROP TABLE content_articles_old").run();
+    })();
+    console.log("Successfully migrated content_articles to support NULL topic_id.");
+  }
+} catch (migErr) {
+  console.error("Migration to make topic_id nullable failed:", migErr);
+}
+
+// Migrate existing batch names from 'Batch of 202X' to 'Batch 202X' for consistent naming conventions
+try {
+  db.prepare("UPDATE batch_memories SET batch_name = REPLACE(batch_name, 'Batch of ', 'Batch ') WHERE batch_name LIKE 'Batch of %'").run();
+} catch (migErr) {
+  console.error("Migration error for batch names:", migErr);
+}
+
+// Seed memory_batches
+try {
+  const batchCountResult = db.prepare('SELECT COUNT(*) as count FROM memory_batches').get() as { count: number };
+  if (batchCountResult.count === 0) {
+    const defaultBatches = ['Batch 2023', 'Batch 2024', 'Batch 2025', 'Batch 2026'];
+    const insertBatch = db.prepare('INSERT OR IGNORE INTO memory_batches (name) VALUES (?)');
+    for (const b of defaultBatches) {
+      insertBatch.run(b);
+    }
+    console.log("[Seed] Successfully seeded default batch cohorts");
+  }
+} catch (seedErr) {
+  console.error("Failed to seed memory_batches:", seedErr);
+}
+
+// Seed default subjects and topics if empty
+try {
+  const subjectCountResult = db.prepare('SELECT COUNT(*) as count FROM content_subjects').get() as { count: number };
+  if (subjectCountResult.count === 0) {
+    const defaultSubjects = [
+      { name: 'Hematology', logo: 'HeartPulse' },
+      { name: 'Clinical Biochemistry', logo: 'FlaskConical' },
+      { name: 'Medical Microbiology', logo: 'Microscope' },
+      { name: 'Histopathology', logo: 'Dna' },
+      { name: 'Clinical Immunology', logo: 'Activity' }
+    ];
+    const insertSubject = db.prepare('INSERT INTO content_subjects (name, logo) VALUES (?, ?)');
+    const insertTopic = db.prepare('INSERT INTO content_topics (subject_id, name) VALUES (?, ?)');
+    const insertArticle = db.prepare('INSERT INTO content_articles (topic_id, headline, content, author_name, is_ai_generated) VALUES (?, ?, ?, ?, ?)');
+
+    for (const sub of defaultSubjects) {
+      const info = insertSubject.run(sub.name, sub.logo);
+      const subId = info.lastInsertRowid;
+
+      // Seed a couple of default topics and articles for each default subject
+      if (sub.name === 'Hematology') {
+        const t1 = insertTopic.run(subId, 'Introduction to Anemias');
+        insertArticle.run(t1.lastInsertRowid, 'Iron Deficiency Anemia: Etiology and Diagnosis', 'Iron deficiency anemia occurs due to dietary lack, chronic blood loss, or malabsorption of iron. Lab parameters show decreased hemoglobin, decreased serum ferritin, decreased MCV and MCH, and increased Total Iron Binding Capacity (TIBC). Peripheral blood smear shows microcytic hypochromic red blood cells with marked anisopoikilocytosis.', 'Dr. S. K. Safin', 0);
+
+        const t2 = insertTopic.run(subId, 'Coagulation Pathways');
+        insertArticle.run(t2.lastInsertRowid, 'Understanding PT and APTT tests', 'Prothrombin Time (PT) evaluates the extrinsic and common pathways of coagulation, highly sensitive to factors VII, X, V, II, and fibrinogen. Activated Partial Thromboplastin Time (APTT) evaluates the intrinsic and common pathways (XII, XI, IX, VIII, X, V, II, fibrinogen). Prolonged values indicate clotting factor deficiencies or presence of inhibitors.', 'Pathology Lab Team', 0);
+      } else if (sub.name === 'Clinical Biochemistry') {
+        const t1 = insertTopic.run(subId, 'Renal Function Tests');
+        insertArticle.run(t1.lastInsertRowid, 'Clinical Utility of Serum Creatinine', 'Serum creatinine is a major nitrogenous waste product of muscle metabolism. It is freely filtered by the glomeruli and not reabsorbed, making it an excellent marker of Glomerular Filtration Rate (GFR). Elevated levels are observed in acute kidney injury, chronic kidney disease, and post-renal obstructions.', 'Medical Biochemistry Desk', 0);
+      } else if (sub.name === 'Medical Microbiology') {
+        const t1 = insertTopic.run(subId, 'Bacterial Staining Techniques');
+        insertArticle.run(t1.lastInsertRowid, 'Gram Staining: Principles and Procedure', 'Gram staining differentiates bacteria into Gram-positive (violet) and Gram-negative (pink) based on cell wall composition. Step 1: Primary stain (Crystal Violet). Step 2: Mordant (Gram\'s Iodine). Step 3: Decolorizer (Acetone/Alcohol). Step 4: Counterstain (Safranin). Gram-positive bacteria retain the crystal violet-iodine complex due to their thick peptidoglycan layer.', 'Microbiology Club', 0);
+      } else {
+        const t1 = insertTopic.run(subId, 'General Diagnostics Overview');
+        insertArticle.run(t1.lastInsertRowid, 'Standard Operating Procedures in Student Labs', 'All clinical diagnostics start with robust adherence to safety profiles, wearing personal protective equipment (PPE), validating specimen container signatures, labeling with double confirmation identifier keys, and performing baseline control assays before processing active samples.', 'System Admin', 0);
+      }
+    }
+    console.log("[Seed] Successfully seeded default content subjects and topics");
+  }
+} catch (seedErr) {
+  console.error("Failed to seed content library database:", seedErr);
+}
+
+// Seed default standalone books
+try {
+  const booksCountResult = db.prepare('SELECT COUNT(*) as count FROM standalone_books').get() as { count: number };
+  if (booksCountResult.count === 0) {
+    const defaultBooks = [
+      { title: 'Ross & Wilson Anatomy and Physiology', author_name: 'Dr. S. K. Safin', cover_color: 'teal' },
+      { title: 'Godkar Textbook of Medical Laboratory Technology', author_name: 'Pathology Lab Team', cover_color: 'indigo' },
+      { title: 'Ananthanarayan Microbiology Book', author_name: 'Microbiology Club', cover_color: 'emerald' },
+      { title: 'Harsh Mohan Textbook of Pathology', author_name: 'System Admin', cover_color: 'rose' }
+    ];
+    const insertBook = db.prepare('INSERT INTO standalone_books (title, author_name, cover_color) VALUES (?, ?, ?)');
+    for (const b of defaultBooks) {
+      insertBook.run(b.title, b.author_name, b.cover_color);
+    }
+    console.log("[Seed] Successfully seeded default standalone books");
+  }
+} catch (bkSeedErr) {
+  console.error("Failed to seed standalone books:", bkSeedErr);
+}
+
+
+// Migrations for memory_batches to support cover_url, avatar_url, and motto
+try {
+  const mbTableInfo = db.prepare("PRAGMA table_info(memory_batches)").all() as any[];
+  const mbColumns = mbTableInfo.map(c => c.name);
+  if (!mbColumns.includes('cover_url')) {
+    db.exec("ALTER TABLE memory_batches ADD COLUMN cover_url TEXT DEFAULT NULL");
+  }
+  if (!mbColumns.includes('avatar_url')) {
+    db.exec("ALTER TABLE memory_batches ADD COLUMN avatar_url TEXT DEFAULT NULL");
+  }
+  if (!mbColumns.includes('motto')) {
+    db.exec("ALTER TABLE memory_batches ADD COLUMN motto TEXT DEFAULT NULL");
+  }
+} catch (mbErr) {
+  console.error("Failed to run memory_batches migrations:", mbErr);
+}
+
+// Migrations for demanding_items
+const chilliTableInfo = db.prepare("PRAGMA table_info(demanding_items)").all() as any[];
+const chilliColumns = chilliTableInfo.map(c => c.name);
+if (!chilliColumns.includes('category')) {
+  db.exec("ALTER TABLE demanding_items ADD COLUMN category TEXT DEFAULT 'Trending'");
+}
+
+// Migrations for performances table
+const tableInfo = db.prepare("PRAGMA table_info(performances)").all() as any[];
+const columns = tableInfo.map(c => c.name);
+
+if (!columns.includes('group_type')) {
+  db.exec("ALTER TABLE performances ADD COLUMN group_type TEXT NOT NULL DEFAULT 'Single'");
+}
+if (!columns.includes('category')) {
+  db.exec("ALTER TABLE performances ADD COLUMN category TEXT NOT NULL DEFAULT ''");
+}
+if (!columns.includes('media_url')) {
+  db.exec("ALTER TABLE performances ADD COLUMN media_url TEXT");
+}
+if (!columns.includes('media_type')) {
+  db.exec("ALTER TABLE performances ADD COLUMN media_type TEXT");
+}
+if (!columns.includes('time')) {
+  db.exec("ALTER TABLE performances ADD COLUMN time TEXT NOT NULL DEFAULT '19:00'");
+}
+if (!columns.includes('contact_info')) {
+  db.exec("ALTER TABLE performances ADD COLUMN contact_info TEXT");
+}
+if (!columns.includes('doc_id')) {
+  db.exec("ALTER TABLE performances ADD COLUMN doc_id TEXT");
+}
+
+if (!columns.includes('is_approved')) {
+  db.exec("ALTER TABLE performances ADD COLUMN is_approved INTEGER DEFAULT 0");
+}
+if (!columns.includes('program')) {
+  db.exec("ALTER TABLE performances ADD COLUMN program TEXT");
+}
+if (!columns.includes('program_id')) {
+  db.exec("ALTER TABLE performances ADD COLUMN program_id TEXT");
+}
+
+// Tables are initialized, now ensure they are empty if desired
+// db.exec("DELETE FROM performances"); 
+// db.exec("DELETE FROM media");
+// db.exec("DELETE FROM demanding_items");
+
+// Seed default admin if empty
+const adminCount = db.prepare('SELECT COUNT(*) as count FROM admins').get() as { count: number };
+if (adminCount.count === 0) {
+  const hashedPassword = bcrypt.hashSync('admin123', 10);
+  db.prepare('INSERT INTO admins (username, password, display_name) VALUES (?, ?, ?)').run('admin', hashedPassword, 'System Admin');
+  
+  // Adding a second admin to demonstrate multi-admin logic
+  const hashedPassword2 = bcrypt.hashSync('staff123', 10);
+  db.prepare('INSERT INTO admins (username, password, display_name) VALUES (?, ?, ?)').run('staff', hashedPassword2, 'Event Staff');
+}
+
+// Seed default demanding_items if empty
+const demandingCount = db.prepare('SELECT COUNT(*) as count FROM demanding_items').get() as { count: number };
+if (demandingCount.count === 0) {
+  const defaultItems = [
+    {
+      type: 'song',
+      title: 'Summer Breeze lofi',
+      link: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
+      description: 'Relaxing background lofi chords for study sessions.',
+      category: 'Chill'
+    },
+    {
+      type: 'song',
+      title: 'Midnight Drive Synthwave',
+      link: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',
+      description: 'Synthesized bassline wave track for driving through campus.',
+      category: 'Synthwave'
+    },
+    {
+      type: 'song',
+      title: 'Sunset Boulevard Solo',
+      link: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3',
+      description: 'Slow melodic acoustic saxophone and piano fusion.',
+      category: 'Retro Jazz'
+    },
+    {
+      type: 'song',
+      title: 'Flow State Electronic',
+      link: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3',
+      description: 'Uplifting deep house and progressive synthesis.',
+      category: 'Electronic'
+    }
+  ];
+
+  const insertStmt = db.prepare('INSERT INTO demanding_items (type, title, link, description, category) VALUES (?, ?, ?, ?, ?)');
+  for (const item of defaultItems) {
+    insertStmt.run(item.type, item.title, item.link, item.description, item.category);
+  }
+}
+
+// Seed default batch memories if empty
+const batchMemoryCount = db.prepare('SELECT COUNT(*) as count FROM batch_memories').get() as { count: number };
+if (batchMemoryCount.count === 0) {
+  const defaultMemories = [
+    {
+      batch_name: 'Batch of 2024',
+      title: 'Our final Year-End Farewell dinner! We will miss the lab chats and late night bug hunting.',
+      url: 'https://images.unsplash.com/photo-1523050854058-8df90110c9f1?q=80&w=800',
+      type: 'photo',
+      uploaded_by: 'Rohit Sharma (CSE 24)'
+    },
+    {
+      batch_name: 'Batch of 2023',
+      title: 'Winning the annual inter-department Hackathon championship! CSE seniors took the trophy.',
+      url: 'https://images.unsplash.com/photo-1517486808906-6ca8b3f04846?q=80&w=800',
+      type: 'photo',
+      uploaded_by: 'Ananya Sen (ECE 23)'
+    },
+    {
+      batch_name: 'Batch of 2024',
+      title: 'Group study session in the main library before the brutal operating systems endsem.',
+      url: 'https://images.unsplash.com/photo-1522202176988-66273c2fd55f?q=80&w=800',
+      type: 'photo',
+      uploaded_by: 'Kabir Das (CSE 24)'
+    },
+    {
+      batch_name: 'Batch of 2022',
+      title: 'Memory video compilation. Remembering the campus walks, teachers, and student groups.',
+      url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      type: 'video',
+      uploaded_by: 'Sneha Patil (IT 22)'
+    }
+  ];
+
+  const insertMemStmt = db.prepare('INSERT INTO batch_memories (batch_name, title, url, type, uploaded_by) VALUES (?, ?, ?, ?, ?)');
+  for (const memory of defaultMemories) {
+    insertMemStmt.run(memory.batch_name, memory.title, memory.url, memory.type, memory.uploaded_by);
+  }
+}
+
+// Seed default core settings for specific image keys if not already present
+const defaultSettings = [
+  { key: 'home_image_1', value: '/images/Hero 01.webp' },
+  { key: 'home_image_2', value: '/images/Hero 02.webp' },
+  { key: 'home_image_3', value: '/images/Hero 03.webp' },
+  { key: 'polaroid_image_1', value: '/images/polaroid_1.png' },
+  { key: 'polaroid_image_2', value: '/images/polaroid_2.png' },
+  { key: 'polaroid_image_3', value: '/images/polaroid_3.png' },
+  { key: 'showcase_image_1', value: '/images/legacy_1.png' },
+  { key: 'showcase_image_2', value: '/images/legacy_2.png' }
+];
+
+const insertSetting = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+for (const item of defaultSettings) {
+  insertSetting.run(item.key, item.value);
+}
+}
+
+declare module 'express-session' {
+  interface SessionData {
+    adminId: number;
+    username: string;
+    displayName: string;
+  }
+}
+
 async function startServer() {
+  // Restore database from Firestore backup first
+  if (firestoreDb) {
+    try {
+      await restoreDatabase();
+    } catch (restoreErr) {
+      console.error('[Firestore Sync] Failed to restore database on startup, continuing with local file...', restoreErr);
+    }
+  }
+
+  // Open SQLite database connection
+  try {
+    db = new Database(dbPath);
+    // Integrity check to fail fast if corrupted
+    db.pragma('integrity_check');
+  } catch (err: any) {
+    console.error('[Database] Failed to open SQLite database. Checking for corruption...', err);
+    if (err.message && (err.message.includes('corrupt') || err.message.includes('malformed') || err.code === 'SQLITE_CORRUPT')) {
+      console.warn('[Database] Database is corrupted, discarding and recreating a clean database file.');
+      try {
+        if (fs.existsSync(dbPath)) {
+          fs.unlinkSync(dbPath);
+        }
+        db = new Database(dbPath);
+      } catch (innerErr) {
+        console.error('[Database] Critical error recreating database:', innerErr);
+        throw innerErr;
+      }
+    } else {
+      throw err;
+    }
+  }
+
+  // Re-establish baseline modified time
+  if (fs.existsSync(dbPath)) {
+    lastBackupMtime = fs.statSync(dbPath).mtimeMs;
+  }
+
+  // Initialize and migrate schema & seed data
+  initDbAndMigrations();
+
   const app = express();
   // On Render.com, we must use process.env.PORT. In AI Studio/local, we use strictly 3000.
   const PORT = (process.env.RENDER && process.env.PORT) ? parseInt(process.env.PORT) : 3000;
@@ -125,7 +1077,7 @@ async function startServer() {
   }
 
   app.use(session({
-    store: new PgSessionStore({ pool: pool, tableName: 'session' }) as any,
+    store: new SQLiteStore({ db: sessionDb, dir: sessionDir }) as any,
     secret: 'campus-pulse-secret-key',
     resave: true,
     saveUninitialized: true,
@@ -219,7 +1171,7 @@ async function startServer() {
     // Automatically save refreshed tokens
     oauth2Client.on('tokens', (newTokens) => {
       console.log('[OAuth] Tokens refreshed, saving to DB');
-      const tokensSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
+      const tokensSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
       let currentTokens = {};
       if (tokensSetting) {
         try {
@@ -229,13 +1181,13 @@ async function startServer() {
         }
       }
       const updatedTokens = { ...currentTokens, ...newTokens };
-      await db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('google_tokens', JSON.stringify(updatedTokens));
+      db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('google_tokens', JSON.stringify(updatedTokens));
     });
 
     return oauth2Client;
   };
 
-  app.get('/api/auth/google', requireAdmin, async (req, res) => {
+  app.get('/api/auth/google', requireAdmin, (req, res) => {
     try {
       const oauth2Client = getOAuthClient(req);
       const url = oauth2Client.generateAuthUrl({
@@ -259,7 +1211,7 @@ async function startServer() {
     
     try {
       const { tokens } = await oauth2Client.getToken(code as string);
-      await db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('google_tokens', JSON.stringify(tokens));
+      db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('google_tokens', JSON.stringify(tokens));
       
       res.send(`
         <html>
@@ -281,9 +1233,9 @@ async function startServer() {
     }
   });
 
-  app.get('/api/admin/google-status', requireAdmin, async (req, res) => {
-    const tokens = await db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
-    const spreadsheetId = await db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
+  app.get('/api/admin/google-status', requireAdmin, (req, res) => {
+    const tokens = db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
+    const spreadsheetId = db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
     
     res.json({
       connected: !!tokens,
@@ -291,7 +1243,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/admin/spreadsheet-id', requireAdmin, async (req, res) => {
+  app.post('/api/admin/spreadsheet-id', requireAdmin, (req, res) => {
     let { spreadsheetId } = req.body;
     
     if (!spreadsheetId || typeof spreadsheetId !== 'string') {
@@ -310,19 +1262,19 @@ async function startServer() {
       return res.status(400).json({ error: 'Spreadsheet ID cannot be empty' });
     }
 
-    await db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('spreadsheet_id', spreadsheetId);
+    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('spreadsheet_id', spreadsheetId);
     res.json({ success: true, spreadsheetId });
   });
 
   // File Upload Setup
-  const uploadDir = process.env.UPLOADS_PATH || 'uploads';
+  const uploadDir = 'uploads';
   if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
+    fs.mkdirSync(uploadDir);
   }
-  const upload = multer({ dest: uploadDir });
+  const upload = multer({ dest: uploadDir + '/' });
 
   // Serve uploads directory statically so uploads work locally and in production deployment fallbacks
-  app.use('/uploads', express.static(uploadDir));
+  app.use('/uploads', express.static(path.join(process.cwd(), uploadDir)));
 
   app.post('/api/admin/upload', requireAdmin, upload.single('file'), async (req, res) => {
     return handleDriveUpload(req, res);
@@ -348,7 +1300,7 @@ async function startServer() {
       console.warn('[Upload Fallback] Failed to rename uploaded file, keeping original path', e);
     }
 
-    const tokensSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
+    const tokensSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
     
     if (!tokensSetting) {
       // Direct Local Upload Fallback
@@ -410,8 +1362,8 @@ async function startServer() {
   }
 
   app.post('/api/admin/sync-sheets', requireAdmin, async (req, res) => {
-    const tokensSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
-    const spreadsheetIdSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
+    const tokensSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
+    const spreadsheetIdSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
 
     if (!tokensSetting || !spreadsheetIdSetting?.value) {
       return res.status(400).json({ error: 'Google Sheets not configured' });
@@ -556,8 +1508,8 @@ async function startServer() {
   });
 
   app.get('/api/admin/sheet-data', requireAdmin, async (req, res) => {
-    const tokensSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
-    const spreadsheetIdSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
+    const tokensSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
+    const spreadsheetIdSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
 
     if (!tokensSetting || !spreadsheetIdSetting?.value) {
       return res.status(400).json({ error: 'Google Sheets not configured' });
@@ -680,11 +1632,11 @@ async function startServer() {
           
           if (isNaN(id)) {
             // Check if a performance with this title and performer already exists to prevent duplicates
-            const existing = await db.prepare('SELECT id FROM performances WHERE title = ? AND performer = ?').get(p.title, p.performer || '') as { id: number } | undefined;
+            const existing = db.prepare('SELECT id FROM performances WHERE title = ? AND performer = ?').get(p.title, p.performer || '') as { id: number } | undefined;
             
             if (existing) {
               // Update existing instead of inserting
-              await db.prepare(`
+              db.prepare(`
                 UPDATE performances 
                 SET description = ?, group_type = ?, category = ?, media_url = ?, media_type = ?, contact_info = ?, is_approved = ?
                 WHERE id = ?
@@ -700,7 +1652,7 @@ async function startServer() {
               );
             } else {
               // New item
-              await db.prepare(`
+              db.prepare(`
                 INSERT INTO performances (title, description, performer, group_type, category, media_url, media_type, contact_info, is_approved)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
               `).run(
@@ -717,7 +1669,7 @@ async function startServer() {
             }
           } else {
             // Update existing by ID
-            await db.prepare(`
+            db.prepare(`
               UPDATE performances 
               SET title = ?, description = ?, performer = ?, group_type = ?, category = ?, media_url = ?, media_type = ?, contact_info = ?, is_approved = ?
               WHERE id = ?
@@ -743,10 +1695,10 @@ async function startServer() {
           const id = parseInt(c.id);
           if (isNaN(id)) {
             // Check if already exists by title and type
-            const existing = await db.prepare('SELECT id FROM demanding_items WHERE title = ? AND type = ?').get(c.title, c.type) as { id: number } | undefined;
+            const existing = db.prepare('SELECT id FROM demanding_items WHERE title = ? AND type = ?').get(c.title, c.type) as { id: number } | undefined;
             
             if (existing) {
-              await db.prepare(`
+              db.prepare(`
                 UPDATE demanding_items 
                 SET link = ?, description = ?, category = ?
                 WHERE id = ?
@@ -758,7 +1710,7 @@ async function startServer() {
               );
             } else {
               // New item
-              await db.prepare(`
+              db.prepare(`
                 INSERT INTO demanding_items (type, title, link, description, category)
                 VALUES (?, ?, ?, ?, ?)
               `).run(
@@ -771,7 +1723,7 @@ async function startServer() {
             }
           } else {
             // Update existing
-            await db.prepare(`
+            db.prepare(`
               UPDATE demanding_items 
               SET type = ?, title = ?, link = ?, description = ?, category = ?
               WHERE id = ?
@@ -795,8 +1747,8 @@ async function startServer() {
   });
 
   app.post('/api/public/sync-item', async (req, res) => {
-    const tokensSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
-    const spreadsheetIdSetting = await db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
+    const tokensSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('google_tokens') as { value: string } | undefined;
+    const spreadsheetIdSetting = db.prepare('SELECT value FROM settings WHERE key = ?').get('spreadsheet_id') as { value: string } | undefined;
 
     if (!tokensSetting || !spreadsheetIdSetting?.value) {
       return res.status(200).json({ success: false, message: 'Google Sheets not configured' });
@@ -858,7 +1810,7 @@ async function startServer() {
   });
 
   // Log all requests for debugging
-  app.use(async (req, res, next) => {
+  app.use((req, res, next) => {
     if (req.path.startsWith('/api/admin')) {
       console.log(`[Request] ${req.method} ${req.path} - SessionID: ${req.sessionID} - Cookie: ${req.headers.cookie ? 'Present' : 'Missing'}`);
     }
@@ -866,9 +1818,9 @@ async function startServer() {
   });
 
   // Auth Routes
-  app.post('/api/admin/login', async (req, res) => {
+  app.post('/api/admin/login', (req, res) => {
     const { username, password } = req.body;
-    const admin = await db.prepare('SELECT * FROM admins WHERE username = ?').get(username) as any;
+    const admin = db.prepare('SELECT * FROM admins WHERE username = ?').get(username) as any;
 
     if (admin && bcrypt.compareSync(password, admin.password)) {
       req.session.adminId = admin.id;
@@ -897,14 +1849,14 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/logout', async (req, res) => {
+  app.post('/api/admin/logout', (req, res) => {
     req.session.destroy((err) => {
       if (err) return res.status(500).json({ error: 'Could not log out' });
       res.json({ success: true });
     });
   });
 
-  app.get('/api/admin/me', async (req, res) => {
+  app.get('/api/admin/me', (req, res) => {
     if (req.session.adminId) {
       res.json({ 
         authenticated: true, 
@@ -920,39 +1872,39 @@ async function startServer() {
   });
 
   // Demanding Items API
-  app.get('/api/demanding-items', async (req, res) => {
-    const items = await db.prepare('SELECT * FROM demanding_items ORDER BY created_at DESC').all();
+  app.get('/api/demanding-items', (req, res) => {
+    const items = db.prepare('SELECT * FROM demanding_items ORDER BY created_at DESC').all();
     res.json(items);
   });
 
-  app.post('/api/admin/demanding-items', requireAdmin, async (req, res) => {
+  app.post('/api/admin/demanding-items', requireAdmin, (req, res) => {
     const { type, title, link, description, category } = req.body;
     if (!type || !title || !link) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    const info = await db.prepare('INSERT INTO demanding_items (type, title, link, description, category) VALUES (?, ?, ?, ?, ?)').run(type, title, link, description, category || 'Trending');
+    const info = db.prepare('INSERT INTO demanding_items (type, title, link, description, category) VALUES (?, ?, ?, ?, ?)').run(type, title, link, description, category || 'Trending');
     res.json({ id: info.lastInsertRowid });
   });
 
-  app.put('/api/admin/demanding-items/:id', requireAdmin, async (req, res) => {
+  app.put('/api/admin/demanding-items/:id', requireAdmin, (req, res) => {
     const { type, title, link, description, category } = req.body;
     if (!type || !title || !link) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    await db.prepare('UPDATE demanding_items SET type = ?, title = ?, link = ?, description = ?, category = ? WHERE id = ?').run(type, title, link, description, category || 'Trending', req.params.id);
+    db.prepare('UPDATE demanding_items SET type = ?, title = ?, link = ?, description = ?, category = ? WHERE id = ?').run(type, title, link, description, category || 'Trending', req.params.id);
     res.json({ success: true });
   });
 
-  app.delete('/api/admin/demanding-items/:id', requireAdmin, async (req, res) => {
-    await db.prepare('DELETE FROM demanding_items WHERE id = ?').run(req.params.id);
+  app.delete('/api/admin/demanding-items/:id', requireAdmin, (req, res) => {
+    db.prepare('DELETE FROM demanding_items WHERE id = ?').run(req.params.id);
     res.json({ success: true });
   });
 
   // --- STANDALONE BOOKS API ---
 
-  app.get('/api/books', async (req, res) => {
+  app.get('/api/books', (req, res) => {
     try {
-      const books = await db.prepare(`
+      const books = db.prepare(`
         SELECT b.*, COUNT(d.id) as document_count
         FROM standalone_books b
         LEFT JOIN book_documents d ON b.id = d.book_id
@@ -965,12 +1917,12 @@ async function startServer() {
     }
   });
 
-  app.post('/api/books', async (req, res) => {
+  app.post('/api/books', (req, res) => {
     const { title, author_name, cover_color, allow_download } = req.body;
     if (!title) return res.status(400).json({ error: 'Book title is required' });
     const isDownloadable = allow_download !== undefined ? Number(allow_download) : 1;
     try {
-      const info = await db.prepare('INSERT INTO standalone_books (title, author_name, cover_color, allow_download) VALUES (?, ?, ?, ?)')
+      const info = db.prepare('INSERT INTO standalone_books (title, author_name, cover_color, allow_download) VALUES (?, ?, ?, ?)')
         .run(title, author_name || 'BMLT Director', cover_color || 'teal', isDownloadable);
       res.json({ id: info.lastInsertRowid, title, author_name: author_name || 'BMLT Director', cover_color: cover_color || 'teal', allow_download: isDownloadable });
     } catch (err: any) {
@@ -978,12 +1930,12 @@ async function startServer() {
     }
   });
 
-  app.put('/api/books/:id', async (req, res) => {
+  app.put('/api/books/:id', (req, res) => {
     const { title, author_name, cover_color, allow_download } = req.body;
     if (!title) return res.status(400).json({ error: 'Book title is required' });
     const isDownloadable = allow_download !== undefined ? Number(allow_download) : 1;
     try {
-      await db.prepare('UPDATE standalone_books SET title = ?, author_name = ?, cover_color = ?, allow_download = ? WHERE id = ?')
+      db.prepare('UPDATE standalone_books SET title = ?, author_name = ?, cover_color = ?, allow_download = ? WHERE id = ?')
         .run(title, author_name || 'BMLT Director', cover_color || 'teal', isDownloadable, req.params.id);
       res.json({ success: true, id: req.params.id, title, author_name, cover_color, allow_download: isDownloadable });
     } catch (err: any) {
@@ -991,18 +1943,18 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/books/:id', async (req, res) => {
+  app.delete('/api/books/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM standalone_books WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM standalone_books WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete book' });
     }
   });
 
-  app.get('/api/books/:id/documents', async (req, res) => {
+  app.get('/api/books/:id/documents', (req, res) => {
     try {
-      const docs = await db.prepare('SELECT * FROM book_documents WHERE book_id = ? ORDER BY created_at DESC').all(req.params.id);
+      const docs = db.prepare('SELECT * FROM book_documents WHERE book_id = ? ORDER BY created_at DESC').all(req.params.id);
       res.json(docs);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch book documents' });
@@ -1034,7 +1986,7 @@ async function startServer() {
       const resolvedTitle = title || req.file.originalname;
       const resolvedAuthor = author_name || 'BMLT Scholar';
 
-      const info = await db.prepare('INSERT INTO book_documents (book_id, title, file_path, author_name, allow_download) VALUES (?, ?, ?, ?, ?)')
+      const info = db.prepare('INSERT INTO book_documents (book_id, title, file_path, author_name, allow_download) VALUES (?, ?, ?, ?, ?)')
         .run(book_id, resolvedTitle, fileUrl, resolvedAuthor, isDownloadable);
 
       res.json({
@@ -1051,22 +2003,43 @@ async function startServer() {
     }
   });
 
-  app.put('/api/books/documents/:id', requireAdmin, (req: any, res: any) => {
-    const { title, author_name, allow_download } = req.body;
+  app.put('/api/books/documents/:id', requireAdmin, upload.single('file'), (req: any, res: any) => {
+    const { title, author_name, allow_download, file_path } = req.body;
     if (!title) return res.status(400).json({ error: 'Title is required' });
     const isDownloadable = allow_download !== undefined ? Number(allow_download) : 1;
+    let resolvedFilePath = file_path || null;
+
+    if (req.file) {
+      const fileExt = path.extname(req.file.originalname).toLowerCase();
+      const sanitizedBase = path.basename(req.file.originalname, fileExt).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const uniqueFilename = `${Date.now()}-${sanitizedBase}${fileExt}`;
+      const destinationPath = path.join(uploadDir, uniqueFilename);
+      try {
+        fs.renameSync(req.file.path, destinationPath);
+      } catch (renameErr) {
+        fs.copyFileSync(req.file.path, destinationPath);
+        fs.unlinkSync(req.file.path);
+      }
+      resolvedFilePath = `/uploads/${uniqueFilename}`;
+    }
+
     try {
-      await db.prepare('UPDATE book_documents SET title = ?, author_name = ?, allow_download = ? WHERE id = ?')
-        .run(title, author_name || 'BMLT Scholar', isDownloadable, req.params.id);
-      res.json({ success: true });
+      if (resolvedFilePath) {
+        db.prepare('UPDATE book_documents SET title = ?, author_name = ?, allow_download = ?, file_path = ? WHERE id = ?')
+          .run(title, author_name || 'BMLT Scholar', isDownloadable, resolvedFilePath, req.params.id);
+      } else {
+        db.prepare('UPDATE book_documents SET title = ?, author_name = ?, allow_download = ? WHERE id = ?')
+          .run(title, author_name || 'BMLT Scholar', isDownloadable, req.params.id);
+      }
+      res.json({ success: true, file_path: resolvedFilePath });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update book document' });
     }
   });
 
-  app.delete('/api/books/documents/:id', async (req, res) => {
+  app.delete('/api/books/documents/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM book_documents WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM book_documents WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete book document' });
@@ -1075,22 +2048,22 @@ async function startServer() {
 
   // --- NEWS AND UPDATES API ---
 
-  app.get('/api/public/news', async (req, res) => {
+  app.get('/api/public/news', (req, res) => {
     try {
-      const news = await db.prepare('SELECT * FROM news_updates ORDER BY created_at DESC').all();
+      const news = db.prepare('SELECT * FROM news_updates ORDER BY created_at DESC').all();
       res.json(news);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch news' });
     }
   });
 
-  app.post('/api/admin/news', requireAdmin, async (req, res) => {
+  app.post('/api/admin/news', requireAdmin, (req, res) => {
     const { title, content, author_name, category, image_url, file_path } = req.body;
     if (!title || !content) {
       return res.status(400).json({ error: 'Title and content are required' });
     }
     try {
-      const info = await db.prepare('INSERT INTO news_updates (title, content, author_name, category, image_url, file_path) VALUES (?, ?, ?, ?, ?, ?)')
+      const info = db.prepare('INSERT INTO news_updates (title, content, author_name, category, image_url, file_path) VALUES (?, ?, ?, ?, ?, ?)')
         .run(title, content, author_name || 'Admin', category || 'General', image_url || null, file_path || null);
       res.json({ id: info.lastInsertRowid, title, content, author_name: author_name || 'Admin', category: category || 'General', image_url, file_path });
     } catch (err: any) {
@@ -1098,13 +2071,13 @@ async function startServer() {
     }
   });
 
-  app.put('/api/admin/news/:id', requireAdmin, async (req, res) => {
+  app.put('/api/admin/news/:id', requireAdmin, (req, res) => {
     const { title, content, author_name, category, image_url, file_path } = req.body;
     if (!title || !content) {
       return res.status(400).json({ error: 'Title and content are required' });
     }
     try {
-      await db.prepare('UPDATE news_updates SET title = ?, content = ?, author_name = ?, category = ?, image_url = ?, file_path = ? WHERE id = ?')
+      db.prepare('UPDATE news_updates SET title = ?, content = ?, author_name = ?, category = ?, image_url = ?, file_path = ? WHERE id = ?')
         .run(title, content, author_name || 'Admin', category || 'General', image_url || null, file_path || null, req.params.id);
       res.json({ success: true, id: req.params.id, title, content, author_name, category, image_url, file_path });
     } catch (err: any) {
@@ -1112,9 +2085,9 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/admin/news/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/admin/news/:id', requireAdmin, (req, res) => {
     try {
-      await db.prepare('DELETE FROM news_updates WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM news_updates WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete news update' });
@@ -1122,17 +2095,17 @@ async function startServer() {
   });
 
   // --- MCQ SYSTEM APIs ---
-  app.get('/api/public/mcqs', async (req, res) => {
+  app.get('/api/public/mcqs', (req, res) => {
     try {
       const subject_id = req.query.subject_id;
       const topic_id = req.query.topic_id;
       let mcqs;
       if (topic_id) {
-        mcqs = await db.prepare('SELECT * FROM mcqs WHERE topic_id = ? ORDER BY id DESC').all(topic_id);
+        mcqs = db.prepare('SELECT * FROM mcqs WHERE topic_id = ? ORDER BY id DESC').all(topic_id);
       } else if (subject_id) {
-        mcqs = await db.prepare('SELECT * FROM mcqs WHERE subject_id = ? ORDER BY id DESC').all(subject_id);
+        mcqs = db.prepare('SELECT * FROM mcqs WHERE subject_id = ? ORDER BY id DESC').all(subject_id);
       } else {
-        mcqs = await db.prepare('SELECT * FROM mcqs ORDER BY id DESC').all();
+        mcqs = db.prepare('SELECT * FROM mcqs ORDER BY id DESC').all();
       }
       res.json(mcqs);
     } catch (err: any) {
@@ -1140,13 +2113,13 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/mcqs', requireAdmin, async (req, res) => {
+  app.post('/api/admin/mcqs', requireAdmin, (req, res) => {
     const { subject_id, topic_id, question, option_a, option_b, option_c, option_d, option_e, correct_option } = req.body;
     if (!question || !option_a || !option_b || !correct_option) {
       return res.status(400).json({ error: 'Missing question, options A and B, or correct option' });
     }
     try {
-      const info = await db.prepare('INSERT INTO mcqs (subject_id, topic_id, question, option_a, option_b, option_c, option_d, option_e, correct_option) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      const info = db.prepare('INSERT INTO mcqs (subject_id, topic_id, question, option_a, option_b, option_c, option_d, option_e, correct_option) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(
           subject_id ? Number(subject_id) : null,
           topic_id ? Number(topic_id) : null,
@@ -1164,13 +2137,13 @@ async function startServer() {
     }
   });
 
-  app.put('/api/admin/mcqs/:id', requireAdmin, async (req, res) => {
+  app.put('/api/admin/mcqs/:id', requireAdmin, (req, res) => {
     const { subject_id, topic_id, question, option_a, option_b, option_c, option_d, option_e, correct_option } = req.body;
     if (!question || !option_a || !option_b || !correct_option) {
       return res.status(400).json({ error: 'Missing question, options A and B, or correct option' });
     }
     try {
-      await db.prepare('UPDATE mcqs SET subject_id = ?, topic_id = ?, question = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?, option_e = ?, correct_option = ? WHERE id = ?')
+      db.prepare('UPDATE mcqs SET subject_id = ?, topic_id = ?, question = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?, option_e = ?, correct_option = ? WHERE id = ?')
         .run(
           subject_id ? Number(subject_id) : null,
           topic_id ? Number(topic_id) : null,
@@ -1189,9 +2162,9 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/admin/mcqs/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/admin/mcqs/:id', requireAdmin, (req, res) => {
     try {
-      await db.prepare('DELETE FROM mcqs WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM mcqs WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete MCQ' });
@@ -1199,9 +2172,9 @@ async function startServer() {
   });
 
   // Fetch all articles across all subjects and topics for general search & sequential admin DB listing
-  app.get('/api/content/all-articles', async (req, res) => {
+  app.get('/api/content/all-articles', (req, res) => {
     try {
-      const articles = await db.prepare('SELECT * FROM content_articles ORDER BY created_at DESC').all();
+      const articles = db.prepare('SELECT * FROM content_articles ORDER BY created_at DESC').all();
       res.json(articles);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch all articles' });
@@ -1209,9 +2182,9 @@ async function startServer() {
   });
 
   // Fetch all book documents across all books for general search & sequential admin DB listing
-  app.get('/api/content/all-book-documents', async (req, res) => {
+  app.get('/api/content/all-book-documents', (req, res) => {
     try {
-      const docs = await db.prepare('SELECT * FROM book_documents ORDER BY created_at DESC').all();
+      const docs = db.prepare('SELECT * FROM book_documents ORDER BY created_at DESC').all();
       res.json(docs);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch all book documents' });
@@ -1219,12 +2192,12 @@ async function startServer() {
   });
 
   // Rename a book document / chapter directly from the Sequenced Admin Database Console
-  app.put('/api/content/book-document/:id/rename', async (req, res) => {
+  app.put('/api/content/book-document/:id/rename', (req, res) => {
     const { id } = req.params;
     const { title } = req.body;
     if (!title) return res.status(400).json({ error: 'Document title is required' });
     try {
-      await db.prepare('UPDATE book_documents SET title = ? WHERE id = ?').run(title, id);
+      db.prepare('UPDATE book_documents SET title = ? WHERE id = ?').run(title, id);
       res.json({ success: true, message: 'Document renamed beautifully' });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to rename book document' });
@@ -1234,40 +2207,40 @@ async function startServer() {
   // --- CONTENT LIBRARY API ---
 
   // Subjects GET, POST, PUT, DELETE
-  app.get('/api/content/subjects', async (req, res) => {
+  app.get('/api/content/subjects', (req, res) => {
     try {
-      const subjects = await db.prepare('SELECT * FROM content_subjects ORDER BY name ASC').all();
+      const subjects = db.prepare('SELECT * FROM content_subjects ORDER BY name ASC').all();
       res.json(subjects);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch subjects' });
     }
   });
 
-  app.post('/api/content/subjects', requireAdmin, async (req, res) => {
+  app.post('/api/content/subjects', requireAdmin, (req, res) => {
     const { name, logo } = req.body;
     if (!name) return res.status(400).json({ error: 'Subject name is required' });
     try {
-      const info = await db.prepare('INSERT INTO content_subjects (name, logo) VALUES (?, ?)').run(name, logo || 'BookOpen');
+      const info = db.prepare('INSERT INTO content_subjects (name, logo) VALUES (?, ?)').run(name, logo || 'BookOpen');
       res.json({ id: info.lastInsertRowid, name, logo: logo || 'BookOpen' });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to create subject' });
     }
   });
 
-  app.put('/api/content/subjects/:id', requireAdmin, async (req, res) => {
+  app.put('/api/content/subjects/:id', requireAdmin, (req, res) => {
     const { name, logo } = req.body;
     if (!name) return res.status(400).json({ error: 'Subject name is required' });
     try {
-      await db.prepare('UPDATE content_subjects SET name = ?, logo = ? WHERE id = ?').run(name, logo || 'BookOpen', req.params.id);
+      db.prepare('UPDATE content_subjects SET name = ?, logo = ? WHERE id = ?').run(name, logo || 'BookOpen', req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update subject' });
     }
   });
 
-  app.delete('/api/content/subjects/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/content/subjects/:id', requireAdmin, (req, res) => {
     try {
-      await db.prepare('DELETE FROM content_subjects WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM content_subjects WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete subject' });
@@ -1275,40 +2248,40 @@ async function startServer() {
   });
 
   // Topics GET, POST, PUT, DELETE
-  app.get('/api/content/subjects/:id/topics', async (req, res) => {
+  app.get('/api/content/subjects/:id/topics', (req, res) => {
     try {
-      const topics = await db.prepare('SELECT * FROM content_topics WHERE subject_id = ? ORDER BY name ASC').all(req.params.id);
+      const topics = db.prepare('SELECT * FROM content_topics WHERE subject_id = ? ORDER BY name ASC').all(req.params.id);
       res.json(topics);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch topics' });
     }
   });
 
-  app.post('/api/content/topics', requireAdmin, async (req, res) => {
+  app.post('/api/content/topics', requireAdmin, (req, res) => {
     const { name, subject_id } = req.body;
     if (!name || !subject_id) return res.status(400).json({ error: 'Topic name and subject_id are required' });
     try {
-      const info = await db.prepare('INSERT INTO content_topics (name, subject_id) VALUES (?, ?)').run(name, subject_id);
+      const info = db.prepare('INSERT INTO content_topics (name, subject_id) VALUES (?, ?)').run(name, subject_id);
       res.json({ id: info.lastInsertRowid, name, subject_id });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to create topic' });
     }
   });
 
-  app.put('/api/content/topics/:id', requireAdmin, async (req, res) => {
+  app.put('/api/content/topics/:id', requireAdmin, (req, res) => {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: 'Topic name is required' });
     try {
-      await db.prepare('UPDATE content_topics SET name = ? WHERE id = ?').run(name, req.params.id);
+      db.prepare('UPDATE content_topics SET name = ? WHERE id = ?').run(name, req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update topic' });
     }
   });
 
-  app.delete('/api/content/topics/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/content/topics/:id', requireAdmin, (req, res) => {
     try {
-      await db.prepare('DELETE FROM content_topics WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM content_topics WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete topic' });
@@ -1316,27 +2289,27 @@ async function startServer() {
   });
 
   // Articles GET, POST, PUT, DELETE, GENERATE
-  app.get('/api/content/topics/:id/articles', async (req, res) => {
+  app.get('/api/content/topics/:id/articles', (req, res) => {
     try {
-      const articles = await db.prepare('SELECT id, topic_id, subject_id, section, headline, author_name, is_ai_generated, file_path, created_at FROM content_articles WHERE topic_id = ? ORDER BY created_at DESC').all(req.params.id);
+      const articles = db.prepare('SELECT id, topic_id, subject_id, section, headline, author_name, is_ai_generated, file_path, created_at FROM content_articles WHERE topic_id = ? ORDER BY created_at DESC').all(req.params.id);
       res.json(articles);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch articles' });
     }
   });
 
-  app.get('/api/content/subjects/:id/articles', async (req, res) => {
+  app.get('/api/content/subjects/:id/articles', (req, res) => {
     try {
-      const articles = await db.prepare('SELECT id, topic_id, subject_id, section, headline, author_name, is_ai_generated, file_path, created_at FROM content_articles WHERE subject_id = ? ORDER BY created_at DESC').all(req.params.id);
+      const articles = db.prepare('SELECT id, topic_id, subject_id, section, headline, author_name, is_ai_generated, file_path, created_at FROM content_articles WHERE subject_id = ? ORDER BY created_at DESC').all(req.params.id);
       res.json(articles);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch subject articles' });
     }
   });
 
-  app.get('/api/content/articles/:id', async (req, res) => {
+  app.get('/api/content/articles/:id', (req, res) => {
     try {
-      const article = await db.prepare('SELECT * FROM content_articles WHERE id = ?').get(req.params.id);
+      const article = db.prepare('SELECT * FROM content_articles WHERE id = ?').get(req.params.id);
       if (!article) return res.status(404).json({ error: 'Article not found' });
       res.json(article);
     } catch (err: any) {
@@ -1344,14 +2317,14 @@ async function startServer() {
     }
   });
 
-  app.post('/api/content/articles', async (req, res) => {
+  app.post('/api/content/articles', (req, res) => {
     const { topic_id, subject_id, section, headline, content, author_name, file_path, allow_download } = req.body;
     if (!headline || !content || !author_name) {
       return res.status(400).json({ error: 'Missing headline, content, or author_name' });
     }
     const isDownloadable = allow_download !== undefined ? Number(allow_download) : 1;
     try {
-      const info = await db.prepare('INSERT INTO content_articles (topic_id, subject_id, section, headline, content, author_name, is_ai_generated, file_path, allow_download) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)')
+      const info = db.prepare('INSERT INTO content_articles (topic_id, subject_id, section, headline, content, author_name, is_ai_generated, file_path, allow_download) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)')
         .run(topic_id || null, subject_id || null, section || 'textbook', headline, content, author_name, file_path || null, isDownloadable);
       res.json({ id: info.lastInsertRowid, topic_id, subject_id, section, headline, content, author_name, is_ai_generated: 0, file_path, allow_download: isDownloadable });
     } catch (err: any) {
@@ -1359,24 +2332,42 @@ async function startServer() {
     }
   });
 
-  app.put('/api/content/articles/:id', async (req, res) => {
+  app.put('/api/content/articles/:id', upload.single('file'), (req: any, res: any) => {
     const { headline, content, author_name, section, file_path, allow_download } = req.body;
-    if (!headline || !content || !author_name) {
-      return res.status(400).json({ error: 'Missing headline, content, or author_name' });
+    if (!headline || !author_name) {
+      return res.status(400).json({ error: 'Missing headline or author_name' });
     }
     const isDownloadable = allow_download !== undefined ? Number(allow_download) : 1;
+    let resolvedFilePath = file_path || null;
+    let resolvedContent = content || '';
+
+    if (req.file) {
+      const fileExt = path.extname(req.file.originalname).toLowerCase();
+      const sanitizedBase = path.basename(req.file.originalname, fileExt).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const uniqueFilename = `${Date.now()}-${sanitizedBase}${fileExt}`;
+      const destinationPath = path.join(uploadDir, uniqueFilename);
+      try {
+        fs.renameSync(req.file.path, destinationPath);
+      } catch (renameErr) {
+        fs.copyFileSync(req.file.path, destinationPath);
+        fs.unlinkSync(req.file.path);
+      }
+      resolvedFilePath = `/uploads/${uniqueFilename}`;
+      resolvedContent = `Document Attachment: ${req.file.originalname}`;
+    }
+
     try {
-      await db.prepare('UPDATE content_articles SET headline = ?, content = ?, author_name = ?, section = ?, file_path = ?, allow_download = ? WHERE id = ?')
-        .run(headline, content, author_name, section || 'textbook', file_path || null, isDownloadable, req.params.id);
-      res.json({ success: true });
+      db.prepare('UPDATE content_articles SET headline = ?, content = ?, author_name = ?, section = ?, file_path = ?, allow_download = ? WHERE id = ?')
+        .run(headline, resolvedContent, author_name, section || 'textbook', resolvedFilePath, isDownloadable, req.params.id);
+      res.json({ success: true, file_path: resolvedFilePath });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update article' });
     }
   });
 
-  app.delete('/api/content/articles/:id', async (req, res) => {
+  app.delete('/api/content/articles/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM content_articles WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM content_articles WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete article' });
@@ -1448,7 +2439,7 @@ Also, use slide splitters \`--- [slide] ---\` between major sections to group th
       }
 
       // Insert article into database
-      const info = await db.prepare('INSERT INTO content_articles (topic_id, headline, content, author_name, is_ai_generated) VALUES (?, ?, ?, ?, 1)').run(topicId, headline, generatedContent, 'VIBE AI Instructor');
+      const info = db.prepare('INSERT INTO content_articles (topic_id, headline, content, author_name, is_ai_generated) VALUES (?, ?, ?, ?, 1)').run(topicId, headline, generatedContent, 'VIBE AI Instructor');
 
       const newArticle = {
         id: info.lastInsertRowid,
@@ -1514,7 +2505,7 @@ Also, use slide splitters \`--- [slide] ---\` between major sections to group th
       }
 
       // Insert directly into the database as a document path item with its text parsed inside the content column
-      const info = await db.prepare('INSERT INTO content_articles (topic_id, subject_id, section, headline, content, author_name, is_ai_generated, file_path, allow_download) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)')
+      const info = db.prepare('INSERT INTO content_articles (topic_id, subject_id, section, headline, content, author_name, is_ai_generated, file_path, allow_download) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)')
         .run(resolvedTopicId, resolvedSubjectId, resolvedSection, resolvedHeadline, extractedContent, userAuthor, fileUrl, isDownloadable);
 
       const newArticle = {
@@ -1612,7 +2603,7 @@ Do not return any other text or wrapper. Return ONLY the JSON.`;
       const headline = `MCQ Study Guide: ${authorPrompt.slice(0, 40)}...`;
       const userAuthor = authorName || 'Academic Advisor';
 
-      const info = await db.prepare('INSERT INTO content_articles (topic_id, subject_id, section, headline, content, author_name, is_ai_generated) VALUES (?, ?, ?, ?, ?, ?, 1)')
+      const info = db.prepare('INSERT INTO content_articles (topic_id, subject_id, section, headline, content, author_name, is_ai_generated) VALUES (?, ?, ?, ?, ?, ?, 1)')
         .run(topicId, subjectId ? Number(subjectId) : null, 'mcq', headline, mcqsJson, userAuthor);
 
       const newArticle = {
@@ -1658,7 +2649,7 @@ Do not return any other text or wrapper. Return ONLY the JSON.`;
       });
 
       // Get existing songs from SQLite database to recommend them if they match!
-      const dbSongs = await db.prepare("SELECT * FROM demanding_items WHERE type = 'song'").all() as any[];
+      const dbSongs = db.prepare("SELECT * FROM demanding_items WHERE type = 'song'").all() as any[];
       const songPool = dbSongs.map(s => ({
         id: s.id,
         title: s.title,
@@ -1759,19 +2750,19 @@ User's described mood: "${mood}"
   });
 
   // Public API Routes
-  app.get('/api/media', async (req, res) => {
-    const media = await db.prepare('SELECT * FROM media ORDER BY year DESC, created_at DESC').all();
+  app.get('/api/media', (req, res) => {
+    const media = db.prepare('SELECT * FROM media ORDER BY year DESC, created_at DESC').all();
     res.json(media);
   });
 
-  app.get('/api/batch-memories', async (req, res) => {
-    const memories = await db.prepare('SELECT * FROM batch_memories ORDER BY batch_name DESC, created_at DESC').all();
+  app.get('/api/batch-memories', (req, res) => {
+    const memories = db.prepare('SELECT * FROM batch_memories ORDER BY batch_name DESC, created_at DESC').all();
     res.json(memories);
   });
 
-  app.get('/api/batches', async (req, res) => {
+  app.get('/api/batches', (req, res) => {
     try {
-      const batches = await db.prepare('SELECT * FROM memory_batches ORDER BY name DESC').all();
+      const batches = db.prepare('SELECT * FROM memory_batches ORDER BY name DESC').all();
       res.json(batches || []);
     } catch (err: any) {
       console.error('Error fetching batches:', err);
@@ -1779,7 +2770,7 @@ User's described mood: "${mood}"
     }
   });
 
-  app.post('/api/admin/batches', requireAdmin, async (req, res) => {
+  app.post('/api/admin/batches', requireAdmin, (req, res) => {
     const { name } = req.body;
     if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ error: 'Batch name is required' });
@@ -1788,7 +2779,7 @@ User's described mood: "${mood}"
     try {
       const trimmedName = name.trim();
       // Ensure it has a valid name format, e.g. "Batch 2027" or "Batch of 2027"
-      await db.prepare('INSERT OR IGNORE INTO memory_batches (name) VALUES (?)').run(trimmedName);
+      db.prepare('INSERT OR IGNORE INTO memory_batches (name) VALUES (?)').run(trimmedName);
       res.json({ success: true, message: `Batch ${trimmedName} added successfully!` });
     } catch (err: any) {
       console.error('Error adding batch:', err);
@@ -1796,7 +2787,7 @@ User's described mood: "${mood}"
     }
   });
 
-  app.delete('/api/admin/batches/:name', requireAdmin, async (req, res) => {
+  app.delete('/api/admin/batches/:name', requireAdmin, (req, res) => {
     const { name } = req.params;
     if (!name) {
       return res.status(400).json({ error: 'Batch name is required' });
@@ -1805,9 +2796,9 @@ User's described mood: "${mood}"
     try {
       const decodedName = decodeURIComponent(name).trim();
       // Precaution/clean-up: Delete all associated memories inside batch_memories
-      await db.prepare('DELETE FROM batch_memories WHERE batch_name = ?').run(decodedName);
+      db.prepare('DELETE FROM batch_memories WHERE batch_name = ?').run(decodedName);
       // Now delete the batch cohort card
-      await db.prepare('DELETE FROM memory_batches WHERE name = ?').run(decodedName);
+      db.prepare('DELETE FROM memory_batches WHERE name = ?').run(decodedName);
       res.json({ success: true, message: `Batch "${decodedName}" and all associated gallery memories were deleted successfully!` });
     } catch (err: any) {
       console.error('Error deleting batch:', err);
@@ -1815,11 +2806,11 @@ User's described mood: "${mood}"
     }
   });
 
-  app.put('/api/admin/batches/:id', requireAdmin, async (req, res) => {
+  app.put('/api/admin/batches/:id', requireAdmin, (req, res) => {
     const { id } = req.params;
     const { cover_url, avatar_url, motto } = req.body;
     try {
-      await db.prepare('UPDATE memory_batches SET cover_url = ?, avatar_url = ?, motto = ? WHERE id = ?')
+      db.prepare('UPDATE memory_batches SET cover_url = ?, avatar_url = ?, motto = ? WHERE id = ?')
         .run(cover_url || null, avatar_url || null, motto || null, id);
       res.json({ success: true, message: 'Batch cohort updated successfully!' });
     } catch (err: any) {
@@ -1828,7 +2819,7 @@ User's described mood: "${mood}"
     }
   });
 
-  app.get('/api/public/settings', async (req, res) => {
+  app.get('/api/public/settings', (req, res) => {
     try {
       const keys = [
         'allow_viewer_uploads',
@@ -1846,10 +2837,27 @@ User's described mood: "${mood}"
       ];
       
       const payload: Record<string, any> = {};
-      const stmt = await db.prepare('SELECT value FROM settings WHERE key = ?');
+      const stmt = db.prepare('SELECT value FROM settings WHERE key = ?');
       
       for (const k of keys) {
-        const row = await stmt.get(k) as { value: string } | undefined;
+        // Enforce environmentOverrides first sothat they can configure default images via env
+        let envVal: string | undefined;
+        if (k === 'home_image_1') envVal = process.env.HOME_IMAGE_1;
+        else if (k === 'home_image_2') envVal = process.env.HOME_IMAGE_2;
+        else if (k === 'home_image_3') envVal = process.env.HOME_IMAGE_3;
+        else if (k === 'polaroid_image_1') envVal = process.env.POLAROID_IMAGE_1;
+        else if (k === 'polaroid_image_2') envVal = process.env.POLAROID_IMAGE_2;
+        else if (k === 'polaroid_image_3') envVal = process.env.POLAROID_IMAGE_3;
+        else if (k === 'showcase_image_1') envVal = process.env.SHOWCASE_IMAGE_1;
+        else if (k === 'showcase_image_2') envVal = process.env.SHOWCASE_IMAGE_2;
+        else if (k === 'custom_app_logo_svg') envVal = process.env.APP_LOGO_URL;
+
+        if (envVal) {
+          payload[k] = envVal;
+          continue;
+        }
+
+        const row = stmt.get(k) as { value: string } | undefined;
         if (k === 'allow_viewer_uploads') {
           payload[k] = row ? row.value === 'true' : true;
         } else if (k === 'breaking_news_enabled') {
@@ -1878,22 +2886,26 @@ User's described mood: "${mood}"
     }
   });
 
-  app.post('/api/admin/settings/batch', requireAdmin, async (req, res) => {
+  app.post('/api/admin/settings/batch', requireAdmin, (req, res) => {
     const settings = req.body;
     if (!settings || typeof settings !== 'object') {
       return res.status(400).json({ error: 'Settings object is required' });
     }
     
     try {
-      for (const [k, v] of Object.entries(settings)) {
-        let strVal = '';
-        if (typeof v === 'boolean') {
-          strVal = v ? 'true' : 'false';
-        } else if (v !== null && v !== undefined) {
-          strVal = String(v);
+      const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+      const tx = db.transaction((data) => {
+        for (const [k, v] of Object.entries(data)) {
+          let strVal = '';
+          if (typeof v === 'boolean') {
+            strVal = v ? 'true' : 'false';
+          } else if (v !== null && v !== undefined) {
+            strVal = String(v);
+          }
+          stmt.run(k, strVal);
         }
-        await db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value').run(k, strVal);
-      }
+      });
+      tx(settings);
       res.json({ success: true, message: 'Settings saved successfully' });
     } catch (err: any) {
       console.error('Error updating settings batch:', err);
@@ -1901,14 +2913,14 @@ User's described mood: "${mood}"
     }
   });
 
-  app.post('/api/admin/settings/allow-viewer-uploads', requireAdmin, async (req, res) => {
+  app.post('/api/admin/settings/allow-viewer-uploads', requireAdmin, (req, res) => {
     const { enabled } = req.body;
     if (enabled === undefined) {
       return res.status(400).json({ error: 'Field "enabled" is required' });
     }
     
     try {
-      await db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('allow_viewer_uploads', enabled ? 'true' : 'false');
+      db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('allow_viewer_uploads', enabled ? 'true' : 'false');
       res.json({ success: true, enabled });
     } catch (err: any) {
       console.error('Error updating viewer uploads setting:', err);
@@ -1916,12 +2928,12 @@ User's described mood: "${mood}"
     }
   });
 
-  app.post('/api/public/batch-memories', async (req, res) => {
+  app.post('/api/public/batch-memories', (req, res) => {
     // Check if public uploads are allowed, or if user is an admin
     const isAdmin = !!(req.session && req.session.adminId);
     if (!isAdmin) {
       try {
-        const row = await db.prepare('SELECT value FROM settings WHERE key = ?').get('allow_viewer_uploads') as { value: string } | undefined;
+        const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('allow_viewer_uploads') as { value: string } | undefined;
         const allowed = row ? row.value === 'true' : true;
         if (!allowed) {
           return res.status(403).json({ error: 'Public uploads are currently disabled by the administrator.' });
@@ -1935,12 +2947,12 @@ User's described mood: "${mood}"
     if (!batch_name || !title || !url || !type) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    const info = await db.prepare('INSERT INTO batch_memories (batch_name, title, url, type, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(batch_name, title, url, type, uploaded_by || 'Anonymous');
+    const info = db.prepare('INSERT INTO batch_memories (batch_name, title, url, type, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(batch_name, title, url, type, uploaded_by || 'Anonymous');
     res.json({ id: info.lastInsertRowid, message: 'Memory successfully added to the Memory Book!' });
   });
 
-  app.get('/api/performances', async (req, res) => {
-    const performances = await db.prepare('SELECT id, title, description, performer, time, group_type, category, media_url, media_type, program, program_id, created_at FROM performances WHERE is_approved = 1 ORDER BY created_at DESC').all();
+  app.get('/api/performances', (req, res) => {
+    const performances = db.prepare('SELECT id, title, description, performer, time, group_type, category, media_url, media_type, program, program_id, created_at FROM performances WHERE is_approved = 1 ORDER BY created_at DESC').all();
     res.json(performances);
   });
 
@@ -1952,44 +2964,44 @@ User's described mood: "${mood}"
     }
     const performanceTime = time || '19:00';
     const categoryStr = Array.isArray(category) ? category.join(', ') : (category || '');
-    const info = await db.prepare('INSERT INTO performances (title, description, performer, time, group_type, category, media_url, media_type, contact_info, doc_id, program, program_id, is_approved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)').run(title, description, performer, performanceTime, group_type, categoryStr, media_url, media_type, contact_info, doc_id, program || 'N/A', program_id || 'default');
+    const info = db.prepare('INSERT INTO performances (title, description, performer, time, group_type, category, media_url, media_type, contact_info, doc_id, program, program_id, is_approved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)').run(title, description, performer, performanceTime, group_type, categoryStr, media_url, media_type, contact_info, doc_id, program || 'N/A', program_id || 'default');
     res.json({ id: info.lastInsertRowid, message: 'Performance submitted for approval' });
   });
 
   // Protected Admin API Routes
-  app.get('/api/admin/performances/all', requireAdmin, async (req, res) => {
-    const performances = await db.prepare('SELECT * FROM performances ORDER BY created_at DESC').all();
+  app.get('/api/admin/performances/all', requireAdmin, (req, res) => {
+    const performances = db.prepare('SELECT * FROM performances ORDER BY created_at DESC').all();
     res.json(performances);
   });
 
-  app.post('/api/admin/performances/:id/approve', requireAdmin, async (req, res) => {
-    const info = await db.prepare('UPDATE performances SET is_approved = 1 WHERE id = ?').run(req.params.id);
+  app.post('/api/admin/performances/:id/approve', requireAdmin, (req, res) => {
+    const info = db.prepare('UPDATE performances SET is_approved = 1 WHERE id = ?').run(req.params.id);
     if (info.changes === 0) {
       return res.status(404).json({ error: 'Performance not found' });
     }
     res.json({ success: true });
   });
 
-  app.post('/api/media', requireAdmin, async (req, res) => {
+  app.post('/api/media', requireAdmin, (req, res) => {
     const { title, url, type, year } = req.body;
     if (!title || !url || !type || !year) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    const info = await db.prepare('INSERT INTO media (title, url, type, year) VALUES (?, ?, ?, ?)').run(title, url, type, year);
+    const info = db.prepare('INSERT INTO media (title, url, type, year) VALUES (?, ?, ?, ?)').run(title, url, type, year);
     res.json({ id: info.lastInsertRowid });
   });
 
-  app.delete('/api/media/:id', requireAdmin, async (req, res) => {
-    await db.prepare('DELETE FROM media WHERE id = ?').run(req.params.id);
+  app.delete('/api/media/:id', requireAdmin, (req, res) => {
+    db.prepare('DELETE FROM media WHERE id = ?').run(req.params.id);
     res.json({ success: true });
   });
 
-  app.delete('/api/admin/batch-memories/:id', requireAdmin, async (req, res) => {
-    await db.prepare('DELETE FROM batch_memories WHERE id = ?').run(req.params.id);
+  app.delete('/api/admin/batch-memories/:id', requireAdmin, (req, res) => {
+    db.prepare('DELETE FROM batch_memories WHERE id = ?').run(req.params.id);
     res.json({ success: true });
   });
 
-  app.post('/api/performances', requireAdmin, async (req, res) => {
+  app.post('/api/performances', requireAdmin, (req, res) => {
     const { title, description, performer, time, group_type, category, media_url, media_type, contact_info, doc_id, is_approved } = req.body;
     if (!title || !description || !performer || !group_type || !category) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -1997,48 +3009,48 @@ User's described mood: "${mood}"
     const performanceTime = time || '19:00';
     const approved = is_approved !== undefined ? is_approved : 0;
     const categoryStr = Array.isArray(category) ? category.join(', ') : (category || '');
-    const info = await db.prepare('INSERT INTO performances (title, description, performer, time, group_type, category, media_url, media_type, contact_info, doc_id, is_approved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(title, description, performer, performanceTime, group_type, categoryStr, media_url, media_type, contact_info, doc_id, approved);
+    const info = db.prepare('INSERT INTO performances (title, description, performer, time, group_type, category, media_url, media_type, contact_info, doc_id, is_approved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(title, description, performer, performanceTime, group_type, categoryStr, media_url, media_type, contact_info, doc_id, approved);
     res.json({ id: info.lastInsertRowid });
   });
 
-  app.put('/api/performances/:id', requireAdmin, async (req, res) => {
+  app.put('/api/performances/:id', requireAdmin, (req, res) => {
     const { title, description, performer, time, group_type, category, media_url, media_type, contact_info } = req.body;
     if (!title || !description || !performer || !group_type || !category) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     const performanceTime = time || '19:00';
     const categoryStr = Array.isArray(category) ? category.join(', ') : (category || '');
-    await db.prepare('UPDATE performances SET title = ?, description = ?, performer = ?, time = ?, group_type = ?, category = ?, media_url = ?, media_type = ?, contact_info = ? WHERE id = ?').run(title, description, performer, performanceTime, group_type, categoryStr, media_url, media_type, contact_info, req.params.id);
+    db.prepare('UPDATE performances SET title = ?, description = ?, performer = ?, time = ?, group_type = ?, category = ?, media_url = ?, media_type = ?, contact_info = ? WHERE id = ?').run(title, description, performer, performanceTime, group_type, categoryStr, media_url, media_type, contact_info, req.params.id);
     res.json({ success: true });
   });
 
-  app.delete('/api/performances/:id', requireAdmin, async (req, res) => {
-    await db.prepare('DELETE FROM performances WHERE id = ?').run(req.params.id);
+  app.delete('/api/performances/:id', requireAdmin, (req, res) => {
+    db.prepare('DELETE FROM performances WHERE id = ?').run(req.params.id);
     res.json({ success: true });
   });
 
-  app.delete('/api/performances/by-doc/:docId', requireAdmin, async (req, res) => {
-    await db.prepare('DELETE FROM performances WHERE doc_id = ?').run(req.params.docId);
+  app.delete('/api/performances/by-doc/:docId', requireAdmin, (req, res) => {
+    db.prepare('DELETE FROM performances WHERE doc_id = ?').run(req.params.docId);
     res.json({ success: true });
   });
 
   // Admin Management (Protected)
-  app.get('/api/admin/list', requireAdminOnly, async (req, res) => {
-    const admins = await db.prepare("SELECT id, username, display_name, COALESCE(role, 'admin') as role, created_at FROM admins").all();
+  app.get('/api/admin/list', requireAdminOnly, (req, res) => {
+    const admins = db.prepare("SELECT id, username, display_name, COALESCE(role, 'admin') as role, created_at FROM admins").all();
     res.json(admins);
   });
 
-  app.post('/api/admin/register', requireAdminOnly, async (req, res) => {
+  app.post('/api/admin/register', requireAdminOnly, (req, res) => {
     const { username, password, display_name, role } = req.body;
     if (!username || !password || !display_name) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     try {
       const hashedPassword = bcrypt.hashSync(password, 10);
-      const info = await db.prepare('INSERT INTO admins (username, password, display_name, role) VALUES (?, ?, ?, ?)').run(username, hashedPassword, display_name, role || 'author');
+      const info = db.prepare('INSERT INTO admins (username, password, display_name, role) VALUES (?, ?, ?, ?)').run(username, hashedPassword, display_name, role || 'author');
       res.json({ id: info.lastInsertRowid });
     } catch (err: any) {
-      if ((err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === '23505')) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         res.status(400).json({ error: 'Username already exists' });
       } else {
         res.status(500).json({ error: 'Internal server error' });
@@ -2046,32 +3058,32 @@ User's described mood: "${mood}"
     }
   });
 
-  app.delete('/api/admin/:id', requireAdminOnly, async (req, res) => {
+  app.delete('/api/admin/:id', requireAdminOnly, (req, res) => {
     const targetId = parseInt(req.params.id);
     if (targetId === req.session.adminId) {
       return res.status(400).json({ error: 'You cannot delete your own account' });
     }
     
-    const adminCount = await db.prepare('SELECT COUNT(*) as count FROM admins').get() as { count: number };
+    const adminCount = db.prepare('SELECT COUNT(*) as count FROM admins').get() as { count: number };
     if (adminCount.count <= 1) {
       return res.status(400).json({ error: 'Cannot delete the last admin account' });
     }
 
-    await db.prepare('DELETE FROM admins WHERE id = ?').run(targetId);
+    db.prepare('DELETE FROM admins WHERE id = ?').run(targetId);
     res.json({ success: true });
   });
 
-  app.put('/api/admin/:id/password', requireAdminOnly, async (req, res) => {
+  app.put('/api/admin/:id/password', requireAdminOnly, (req, res) => {
     const { newPassword } = req.body;
     if (!newPassword) {
       return res.status(400).json({ error: 'New password is required' });
     }
     const hashedPassword = bcrypt.hashSync(newPassword, 10);
-    await db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hashedPassword, req.params.id);
+    db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hashedPassword, req.params.id);
     res.json({ success: true });
   });
 
-  app.post('/api/admin/recovery-reset', async (req, res) => {
+  app.post('/api/admin/recovery-reset', (req, res) => {
     const { username, recoveryKey, newPassword } = req.body;
     const systemRecoveryKey = process.env.ADMIN_RECOVERY_KEY || 'campus-pulse-recovery-2026';
     
@@ -2079,164 +3091,144 @@ User's described mood: "${mood}"
       return res.status(401).json({ error: 'Invalid recovery key' });
     }
 
-    const admin = await db.prepare('SELECT id FROM admins WHERE username = ?').get(username) as { id: number } | undefined;
+    const admin = db.prepare('SELECT id FROM admins WHERE username = ?').get(username) as { id: number } | undefined;
     if (!admin) {
       return res.status(404).json({ error: 'Admin not found' });
     }
 
     const hashedPassword = bcrypt.hashSync(newPassword, 10);
-    await db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hashedPassword, admin.id);
+    db.prepare('UPDATE admins SET password = ? WHERE id = ?').run(hashedPassword, admin.id);
     res.json({ success: true });
   });
 
   // --- BMLT DESK CUSTOM MCQS & CASE STUDIES APIs ---
 
-  // Helper to map free-text correct option to letter (A, B, C, D)
-  function resolveCorrectOption(correct: string, options: { a: string|null, b: string|null, c: string|null, d: string|null }) {
-    if (!correct) return null;
-    const cleanCorrect = correct.trim().toUpperCase();
-    if (['A', 'B', 'C', 'D'].includes(cleanCorrect)) {
-      return cleanCorrect;
-    }
-    const correctLower = correct.trim().toLowerCase();
-    if (options.a && options.a.trim().toLowerCase() === correctLower) return 'A';
-    if (options.b && options.b.trim().toLowerCase() === correctLower) return 'B';
-    if (options.c && options.c.trim().toLowerCase() === correctLower) return 'C';
-    if (options.d && options.d.trim().toLowerCase() === correctLower) return 'D';
-    
-    if (options.a && (options.a.trim().toLowerCase().includes(correctLower) || correctLower.includes(options.a.trim().toLowerCase()))) return 'A';
-    if (options.b && (options.b.trim().toLowerCase().includes(correctLower) || correctLower.includes(options.b.trim().toLowerCase()))) return 'B';
-    if (options.c && (options.c.trim().toLowerCase().includes(correctLower) || correctLower.includes(options.c.trim().toLowerCase()))) return 'C';
-    if (options.d && (options.d.trim().toLowerCase().includes(correctLower) || correctLower.includes(options.d.trim().toLowerCase()))) return 'D';
-
-    return correct;
-  }
-
   // Custom BMLT MCQs
-  app.get('/api/bmlt/mcqs', async (req, res) => {
+  app.get('/api/bmlt/mcqs', (req, res) => {
     try {
-      const mcqs = await db.prepare('SELECT * FROM bmlt_mcqs ORDER BY id DESC').all() as any[];
-      const mapped = mcqs.map(q => ({
-        id: q.id,
-        question: q.question,
-        option_a: q.option_a,
-        option_b: q.option_b,
-        option_c: q.option_c,
-        option_d: q.option_d,
-        correct_option: q.correct_option,
-        image_url: q.image_url,
-        explanation: q.explanation,
-        created_at: q.created_at,
-        // Frontend support:
-        options: [q.option_a, q.option_b, q.option_c, q.option_d].filter(Boolean).join(','),
-        correct: q.correct_option,
-        imageUrl: q.image_url
-      }));
+      const mcqs = db.prepare('SELECT * FROM bmlt_mcqs ORDER BY id DESC').all();
+      const mapped = mcqs.map((q: any) => {
+        const parts = [];
+        if (q.option_a) parts.push(q.option_a);
+        if (q.option_b) parts.push(q.option_b);
+        if (q.option_c) parts.push(q.option_c);
+        if (q.option_d) parts.push(q.option_d);
+        const optionsStr = parts.join(', ');
+
+        let correctText = q.correct_option || '';
+        if (q.correct_option === 'A') correctText = q.option_a || 'A';
+        else if (q.correct_option === 'B') correctText = q.option_b || 'B';
+        else if (q.correct_option === 'C') correctText = q.option_c || 'C';
+        else if (q.correct_option === 'D') correctText = q.option_d || 'D';
+
+        return {
+          ...q,
+          options: optionsStr,
+          correct: correctText,
+          imageUrl: q.image_url || '',
+          explanation: q.explanation || ''
+        };
+      });
       res.json(mapped);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch BMLT MCQs' });
     }
   });
 
-  app.post('/api/bmlt/mcqs', requireAdmin, async (req, res) => {
-    const { 
-      question, 
-      option_a, option_b, option_c, option_d, options, 
-      correct_option, correct, 
-      image_url, imageUrl, 
-      explanation 
-    } = req.body;
-
+  app.post('/api/bmlt/mcqs', (req, res) => {
+    const { question, option_a, option_b, option_c, option_d, correct_option, image_url, imageUrl, explanation, options, correct } = req.body;
+    
     let a = option_a, b = option_b, c = option_c, d = option_d;
     if (options && typeof options === 'string' && !a) {
       const parts = options.split(',').map(s => s.trim());
-      a = parts[0] || null;
-      b = parts[1] || null;
-      c = parts[2] || null;
-      d = parts[3] || null;
+      a = parts[0] || '';
+      b = parts[1] || '';
+      c = parts[2] || '';
+      d = parts[3] || '';
     }
 
-    let final_correct = correct_option || correct;
-    if (final_correct) {
-      final_correct = resolveCorrectOption(final_correct, { a, b, c, d });
+    const final_image_url = image_url || imageUrl || null;
+    
+    let final_correct = correct_option || correct || 'A';
+    const cleanCorrect = final_correct.trim().toLowerCase();
+    const optList = [a, b, c, d].filter(Boolean);
+    let matchedLetter = 'A';
+    let matched = false;
+    for (let i = 0; i < optList.length; i++) {
+      if (optList[i].trim().toLowerCase() === cleanCorrect) {
+        matchedLetter = ['A', 'B', 'C', 'D'][i];
+        matched = true;
+        break;
+      }
     }
-
-    const final_image_url = image_url || imageUrl;
-
-    if (!question || !a || !b || !final_correct) {
-      return res.status(400).json({ error: 'Missing required MCQ fields (question, options, and correct answer are required)' });
+    if (!matched && ['a', 'b', 'c', 'd'].includes(cleanCorrect)) {
+      matchedLetter = cleanCorrect.toUpperCase();
+    }
+    
+    if (!question || !a || !b) {
+      return res.status(400).json({ error: 'Missing required MCQ fields' });
     }
 
     try {
-      const info = await db.prepare(`
+      const info = db.prepare(`
         INSERT INTO bmlt_mcqs (question, option_a, option_b, option_c, option_d, correct_option, image_url, explanation)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(question, a, b, c || null, d || null, final_correct, final_image_url || null, explanation || null);
-
-      res.json({ 
-        id: info.lastInsertRowid, 
-        question, 
-        option_a: a, 
-        option_b: b, 
-        option_c: c, 
-        option_d: d, 
-        correct_option: final_correct, 
-        image_url: final_image_url, 
-        explanation,
-        // Frontend support:
-        options: options || [a, b, c, d].filter(Boolean).join(','),
-        correct: final_correct,
-        imageUrl: final_image_url
-      });
+      `).run(question, a, b, c || null, d || null, matchedLetter, final_image_url, explanation || null);
+      res.json({ id: info.lastInsertRowid, question, option_a: a, option_b: b, option_c: c, option_d: d, correct_option: matchedLetter, image_url: final_image_url, explanation });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to create BMLT MCQ' });
     }
   });
 
-  app.put('/api/bmlt/mcqs/:id', requireAdmin, async (req, res) => {
-    const { 
-      question, 
-      option_a, option_b, option_c, option_d, options, 
-      correct_option, correct, 
-      image_url, imageUrl, 
-      explanation 
-    } = req.body;
-
+  app.put('/api/bmlt/mcqs/:id', (req, res) => {
+    const { question, option_a, option_b, option_c, option_d, correct_option, image_url, imageUrl, explanation, options, correct } = req.body;
+    
     let a = option_a, b = option_b, c = option_c, d = option_d;
     if (options && typeof options === 'string' && !a) {
       const parts = options.split(',').map(s => s.trim());
-      a = parts[0] || null;
-      b = parts[1] || null;
-      c = parts[2] || null;
-      d = parts[3] || null;
+      a = parts[0] || '';
+      b = parts[1] || '';
+      c = parts[2] || '';
+      d = parts[3] || '';
     }
 
-    let final_correct = correct_option || correct;
-    if (final_correct) {
-      final_correct = resolveCorrectOption(final_correct, { a, b, c, d });
+    const final_image_url = image_url || imageUrl || null;
+    
+    let final_correct = correct_option || correct || 'A';
+    const cleanCorrect = final_correct.trim().toLowerCase();
+    const optList = [a, b, c, d].filter(Boolean);
+    let matchedLetter = 'A';
+    let matched = false;
+    for (let i = 0; i < optList.length; i++) {
+      if (optList[i].trim().toLowerCase() === cleanCorrect) {
+        matchedLetter = ['A', 'B', 'C', 'D'][i];
+        matched = true;
+        break;
+      }
     }
-
-    const final_image_url = image_url || imageUrl;
-
-    if (!question || !a || !b || !final_correct) {
+    if (!matched && ['a', 'b', 'c', 'd'].includes(cleanCorrect)) {
+      matchedLetter = cleanCorrect.toUpperCase();
+    }
+    
+    if (!question || !a || !b) {
       return res.status(400).json({ error: 'Missing required MCQ fields' });
     }
 
     try {
-      await db.prepare(`
+      db.prepare(`
         UPDATE bmlt_mcqs 
         SET question = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?, correct_option = ?, image_url = ?, explanation = ?
         WHERE id = ?
-      `).run(question, a, b, c || null, d || null, final_correct, final_image_url || null, explanation || null, req.params.id);
+      `).run(question, a, b, c || null, d || null, matchedLetter, final_image_url, explanation || null, req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update BMLT MCQ' });
     }
   });
 
-  app.delete('/api/bmlt/mcqs/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/bmlt/mcqs/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM bmlt_mcqs WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM bmlt_mcqs WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete BMLT MCQ' });
@@ -2244,37 +3236,44 @@ User's described mood: "${mood}"
   });
 
   // Custom BMLT Case Studies
-  app.get('/api/bmlt/cases', async (req, res) => {
+  app.get('/api/bmlt/cases', (req, res) => {
     try {
-      const cases = await db.prepare('SELECT * FROM bmlt_case_studies ORDER BY id DESC').all() as any[];
-      const mapped = cases.map(cs => ({
-        id: cs.id,
-        type: cs.type,
-        title: cs.title,
-        presentation: cs.presentation,
-        question: cs.question,
-        option_a: cs.option_a,
-        option_b: cs.option_b,
-        option_c: cs.option_c,
-        option_d: cs.option_d,
-        correct_option: cs.correct_option,
-        correct_guidelines: cs.correct_guidelines,
-        created_at: cs.created_at,
-        // Frontend support:
-        scenario: cs.presentation,
-        options: [cs.option_a, cs.option_b, cs.option_c, cs.option_d].filter(Boolean).join(','),
-        correct: cs.type === 'mcq' ? cs.correct_option : cs.correct_guidelines,
-        explanation: cs.explanation || (cs.type === 'paragraph' ? cs.correct_guidelines : ''),
-        normalParams: cs.normal_params || '',
-        normal_params: cs.normal_params || ''
-      }));
+      const cases = db.prepare('SELECT * FROM bmlt_case_studies ORDER BY id DESC').all();
+      const mapped = cases.map((c: any) => {
+        const parts = [];
+        if (c.option_a) parts.push(c.option_a);
+        if (c.option_b) parts.push(c.option_b);
+        if (c.option_c) parts.push(c.option_c);
+        if (c.option_d) parts.push(c.option_d);
+        const optionsStr = parts.join(', ');
+
+        let correctText = '';
+        if (c.type === 'mcq') {
+          if (c.correct_option === 'A') correctText = c.option_a || 'A';
+          else if (c.correct_option === 'B') correctText = c.option_b || 'B';
+          else if (c.correct_option === 'C') correctText = c.option_c || 'C';
+          else if (c.correct_option === 'D') correctText = c.option_d || 'D';
+          else correctText = c.correct_option || '';
+        } else {
+          correctText = c.correct_guidelines || '';
+        }
+
+        return {
+          ...c,
+          scenario: c.presentation || '',
+          options: optionsStr,
+          correct: correctText,
+          explanation: c.correct_guidelines || '',
+          normalParams: c.normal_params || ''
+        };
+      });
       res.json(mapped);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch BMLT cases' });
     }
   });
 
-  app.post('/api/bmlt/cases', requireAdmin, async (req, res) => {
+  app.post('/api/bmlt/cases', (req, res) => {
     const { 
       title, presentation, scenario, type, question, 
       option_a, option_b, option_c, option_d, options,
@@ -2296,28 +3295,40 @@ User's described mood: "${mood}"
       d = parts[3] || null;
     }
 
-    const final_normal_params = normalParams || normal_params || null;
-    const final_explanation = explanation || null;
-
-    let final_correct_option = type === 'mcq' ? (correct_option || correct || null) : null;
-    if (type === 'mcq' && final_correct_option) {
-      final_correct_option = resolveCorrectOption(final_correct_option, { a, b, c, d });
+    let final_correct_option = null;
+    if (type === 'mcq') {
+      const cleanCorrect = (correct_option || correct || 'A').trim().toLowerCase();
+      const optList = [a, b, c, d].filter(Boolean);
+      let matchedLetter = 'A';
+      let matched = false;
+      for (let i = 0; i < optList.length; i++) {
+        if (optList[i].trim().toLowerCase() === cleanCorrect) {
+          matchedLetter = ['A', 'B', 'C', 'D'][i];
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && ['a', 'b', 'c', 'd'].includes(cleanCorrect)) {
+        matchedLetter = cleanCorrect.toUpperCase();
+      }
+      final_correct_option = matchedLetter;
     }
 
-    const final_correct_guidelines = type === 'paragraph' ? (correct_guidelines || correct || null) : null;
+    const final_correct_guidelines = type === 'paragraph' ? (correct_guidelines || explanation || correct || null) : null;
+    const final_normal_params = normalParams !== undefined ? normalParams : (normal_params !== undefined ? normal_params : null);
 
     try {
-      const info = await db.prepare(`
-        INSERT INTO bmlt_case_studies (title, presentation, type, question, option_a, option_b, option_c, option_d, correct_option, correct_guidelines, normal_params, explanation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(title, final_presentation, type, question, a || null, b || null, c || null, d || null, final_correct_option, final_correct_guidelines, final_normal_params, final_explanation);
-      res.json({ id: info.lastInsertRowid, title, presentation: final_presentation, type, question });
+      const info = db.prepare(`
+        INSERT INTO bmlt_case_studies (title, presentation, type, question, option_a, option_b, option_c, option_d, correct_option, correct_guidelines, normal_params)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(title, final_presentation, type, question, a || null, b || null, c || null, d || null, final_correct_option, final_correct_guidelines, final_normal_params);
+      res.json({ id: info.lastInsertRowid, title, presentation: final_presentation, type, question, normalParams: final_normal_params });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to create BMLT case study' });
     }
   });
 
-  app.put('/api/bmlt/cases/:id', requireAdmin, async (req, res) => {
+  app.put('/api/bmlt/cases/:id', (req, res) => {
     const { 
       title, presentation, scenario, type, question, 
       option_a, option_b, option_c, option_d, options,
@@ -2339,31 +3350,43 @@ User's described mood: "${mood}"
       d = parts[3] || null;
     }
 
-    const final_normal_params = normalParams || normal_params || null;
-    const final_explanation = explanation || null;
-
-    let final_correct_option = type === 'mcq' ? (correct_option || correct || null) : null;
-    if (type === 'mcq' && final_correct_option) {
-      final_correct_option = resolveCorrectOption(final_correct_option, { a, b, c, d });
+    let final_correct_option = null;
+    if (type === 'mcq') {
+      const cleanCorrect = (correct_option || correct || 'A').trim().toLowerCase();
+      const optList = [a, b, c, d].filter(Boolean);
+      let matchedLetter = 'A';
+      let matched = false;
+      for (let i = 0; i < optList.length; i++) {
+        if (optList[i].trim().toLowerCase() === cleanCorrect) {
+          matchedLetter = ['A', 'B', 'C', 'D'][i];
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && ['a', 'b', 'c', 'd'].includes(cleanCorrect)) {
+        matchedLetter = cleanCorrect.toUpperCase();
+      }
+      final_correct_option = matchedLetter;
     }
 
-    const final_correct_guidelines = type === 'paragraph' ? (correct_guidelines || correct || null) : null;
+    const final_correct_guidelines = type === 'paragraph' ? (correct_guidelines || explanation || correct || null) : null;
+    const final_normal_params = normalParams !== undefined ? normalParams : (normal_params !== undefined ? normal_params : null);
 
     try {
-      await db.prepare(`
+      db.prepare(`
         UPDATE bmlt_case_studies 
-        SET title = ?, presentation = ?, type = ?, question = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?, correct_option = ?, correct_guidelines = ?, normal_params = ?, explanation = ?
+        SET title = ?, presentation = ?, type = ?, question = ?, option_a = ?, option_b = ?, option_c = ?, option_d = ?, correct_option = ?, correct_guidelines = ?, normal_params = ?
         WHERE id = ?
-      `).run(title, final_presentation, type, question, a || null, b || null, c || null, d || null, final_correct_option, final_correct_guidelines, final_normal_params, final_explanation, req.params.id);
+      `).run(title, final_presentation, type, question, a || null, b || null, c || null, d || null, final_correct_option, final_correct_guidelines, final_normal_params, req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update BMLT case study' });
     }
   });
 
-  app.delete('/api/bmlt/cases/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/bmlt/cases/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM bmlt_case_studies WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM bmlt_case_studies WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete BMLT case study' });
@@ -2371,16 +3394,16 @@ User's described mood: "${mood}"
   });
 
   // Dynamic BMLT Microscope Slides
-  app.get('/api/bmlt/slides', async (req, res) => {
+  app.get('/api/bmlt/slides', (req, res) => {
     try {
-      const slides = await db.prepare('SELECT * FROM bmlt_slides ORDER BY id ASC').all();
+      const slides = db.prepare('SELECT * FROM bmlt_slides ORDER BY id ASC').all();
       res.json(slides);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch BMLT slides' });
     }
   });
 
-  app.post('/api/bmlt/slides', requireAdmin, async (req, res) => {
+  app.post('/api/bmlt/slides', (req, res) => {
     const { name, description, target_cell, targetCell, hint, image_url, imageUrl, fact, options, hotspots } = req.body;
     const final_target_cell = target_cell || targetCell;
     const final_image_url = image_url || imageUrl;
@@ -2389,7 +3412,7 @@ User's described mood: "${mood}"
     }
     try {
       const hspots = typeof hotspots === 'string' ? hotspots : JSON.stringify(hotspots || []);
-      const info = await db.prepare(`
+      const info = db.prepare(`
         INSERT INTO bmlt_slides (name, description, target_cell, hint, image_url, fact, options, hotspots)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(name, description, final_target_cell, hint || '', final_image_url, fact || '', options, hspots);
@@ -2399,7 +3422,7 @@ User's described mood: "${mood}"
     }
   });
 
-  app.put('/api/bmlt/slides/:id', requireAdmin, async (req, res) => {
+  app.put('/api/bmlt/slides/:id', (req, res) => {
     const { name, description, target_cell, targetCell, hint, image_url, imageUrl, fact, options, hotspots } = req.body;
     const final_target_cell = target_cell || targetCell;
     const final_image_url = image_url || imageUrl;
@@ -2408,7 +3431,7 @@ User's described mood: "${mood}"
     }
     try {
       const hspots = typeof hotspots === 'string' ? hotspots : JSON.stringify(hotspots || []);
-      await db.prepare(`
+      db.prepare(`
         UPDATE bmlt_slides 
         SET name = ?, description = ?, target_cell = ?, hint = ?, image_url = ?, fact = ?, options = ?, hotspots = ?
         WHERE id = ?
@@ -2419,9 +3442,9 @@ User's described mood: "${mood}"
     }
   });
 
-  app.delete('/api/bmlt/slides/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/bmlt/slides/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM bmlt_slides WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM bmlt_slides WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete slide' });
@@ -2429,20 +3452,15 @@ User's described mood: "${mood}"
   });
 
   // Dynamic BMLT Laboratory Parameters and normal ranges
-  app.get('/api/bmlt/lab-params', async (req, res) => {
+  app.get('/api/bmlt/lab-params', (req, res) => {
     try {
-      const params = await db.prepare('SELECT * FROM bmlt_lab_params ORDER BY id ASC').all() as any[];
-      const mapped = params.map(p => ({
-        id: p.id,
-        name: p.name,
-        unit: p.unit,
+      const params = db.prepare('SELECT * FROM bmlt_lab_params ORDER BY id ASC').all();
+      const mapped = params.map((p: any) => ({
+        ...p,
         normalMinMale: p.normal_min_male,
         normalMaxMale: p.normal_max_male,
         normalMinFemale: p.normal_min_female,
-        normalMaxFemale: p.normal_max_female,
-        category: p.category,
-        description: p.description,
-        created_at: p.created_at
+        normalMaxFemale: p.normal_max_female
       }));
       res.json(mapped);
     } catch (err: any) {
@@ -2450,7 +3468,7 @@ User's described mood: "${mood}"
     }
   });
 
-  app.post('/api/bmlt/lab-params', requireAdmin, async (req, res) => {
+  app.post('/api/bmlt/lab-params', (req, res) => {
     const { 
       name, unit, 
       normal_min_male, normalMinMale, 
@@ -2470,27 +3488,17 @@ User's described mood: "${mood}"
     const max_female = normal_max_female !== undefined ? normal_max_female : normalMaxFemale;
 
     try {
-      const info = await db.prepare(`
+      const info = db.prepare(`
         INSERT INTO bmlt_lab_params (name, unit, normal_min_male, normal_max_male, normal_min_female, normal_max_female, category, description)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(name, unit, Number(min_male || 0), Number(max_male || 0), Number(min_female || 0), Number(max_female || 0), category, description || '');
-      res.json({ 
-        id: info.lastInsertRowid, 
-        name, 
-        unit, 
-        normalMinMale: Number(min_male || 0), 
-        normalMaxMale: Number(max_male || 0), 
-        normalMinFemale: Number(min_female || 0), 
-        normalMaxFemale: Number(max_female || 0), 
-        category, 
-        description 
-      });
+      res.json({ id: info.lastInsertRowid, name, unit, normal_min_male: min_male, normal_max_male: max_male, normal_min_female: min_female, normal_max_female: max_female, category, description });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to create parameter' });
     }
   });
 
-  app.put('/api/bmlt/lab-params/:id', requireAdmin, async (req, res) => {
+  app.put('/api/bmlt/lab-params/:id', (req, res) => {
     const { 
       name, unit, 
       normal_min_male, normalMinMale, 
@@ -2510,7 +3518,7 @@ User's described mood: "${mood}"
     const max_female = normal_max_female !== undefined ? normal_max_female : normalMaxFemale;
 
     try {
-      await db.prepare(`
+      db.prepare(`
         UPDATE bmlt_lab_params 
         SET name = ?, unit = ?, normal_min_male = ?, normal_max_male = ?, normal_min_female = ?, normal_max_female = ?, category = ?, description = ?
         WHERE id = ?
@@ -2521,9 +3529,9 @@ User's described mood: "${mood}"
     }
   });
 
-  app.delete('/api/bmlt/lab-params/:id', requireAdmin, async (req, res) => {
+  app.delete('/api/bmlt/lab-params/:id', (req, res) => {
     try {
-      await db.prepare('DELETE FROM bmlt_lab_params WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM bmlt_lab_params WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete parameter' });
@@ -2531,13 +3539,13 @@ User's described mood: "${mood}"
   });
 
   // STUDENT AUTH & PROFILE ENDPOINTS
-  app.post('/api/student/login', async (req, res) => {
+  app.post('/api/student/login', (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
     }
     try {
-      const student = await db.prepare('SELECT * FROM students WHERE username = ?').get(username) as any;
+      const student = db.prepare('SELECT * FROM students WHERE username = ?').get(username) as any;
       if (!student) {
         return res.status(401).json({ error: 'Invalid User ID or Password' });
       }
@@ -2577,13 +3585,13 @@ User's described mood: "${mood}"
     }
   });
 
-  app.get('/api/student/me', async (req, res) => {
+  app.get('/api/student/me', (req, res) => {
     const studentId = (req.session as any).studentId;
     if (!studentId) {
       return res.status(401).json({ authenticated: false });
     }
     try {
-      const student = await db.prepare('SELECT * FROM students WHERE id = ?').get(studentId) as any;
+      const student = db.prepare('SELECT * FROM students WHERE id = ?').get(studentId) as any;
       if (!student) {
         return res.status(404).json({ authenticated: false, error: 'Student not found' });
       }
@@ -2608,13 +3616,13 @@ User's described mood: "${mood}"
     }
   });
 
-  app.post('/api/student/logout', async (req, res) => {
+  app.post('/api/student/logout', (req, res) => {
     req.session.destroy((err) => {
       res.json({ success: true });
     });
   });
 
-  app.put('/api/student/profile', async (req, res) => {
+  app.put('/api/student/profile', (req, res) => {
     const studentId = (req.session as any).studentId;
     if (!studentId) {
       return res.status(401).json({ error: 'Unauthorized' });
@@ -2624,14 +3632,14 @@ User's described mood: "${mood}"
     try {
       if (newPassword) {
         const hashedPassword = bcrypt.hashSync(newPassword, 10);
-        await db.prepare('UPDATE students SET display_name = COALESCE(?, display_name), profile_pic = COALESCE(?, profile_pic), password = ? WHERE id = ?')
+        db.prepare('UPDATE students SET display_name = COALESCE(?, display_name), profile_pic = COALESCE(?, profile_pic), password = ? WHERE id = ?')
           .run(displayName, profilePic, hashedPassword, studentId);
       } else {
-        await db.prepare('UPDATE students SET display_name = COALESCE(?, display_name), profile_pic = COALESCE(?, profile_pic) WHERE id = ?')
+        db.prepare('UPDATE students SET display_name = COALESCE(?, display_name), profile_pic = COALESCE(?, profile_pic) WHERE id = ?')
           .run(displayName, profilePic, studentId);
       }
       
-      const updated = await db.prepare('SELECT * FROM students WHERE id = ?').get(studentId) as any;
+      const updated = db.prepare('SELECT * FROM students WHERE id = ?').get(studentId) as any;
       res.json({
         success: true,
         student: {
@@ -2653,39 +3661,57 @@ User's described mood: "${mood}"
     }
   });
 
-  // Student awards point when answering MCQ correctly without duplicates
-  app.post('/api/student/earn-points', async (req, res) => {
+  // Student awards point when answering MCQ, Slide, or Case correctly without duplicates
+  app.post('/api/student/earn-points', (req, res) => {
     const studentId = (req.session as any).studentId;
     if (!studentId) {
       return res.status(401).json({ error: 'Student login required to earn points' });
     }
-    const { pointsToAdd, mcqId, isBmlt } = req.body;
-    if (mcqId === undefined || pointsToAdd === undefined) {
-      return res.status(400).json({ error: 'Missing pointsToAdd or mcqId' });
+    const { pointsToAdd, mcqId, isBmlt, type, id } = req.body;
+    
+    // Fallbacks to support older clients
+    const activityId = id !== undefined ? id : mcqId;
+    let activityType = type;
+    if (!activityType) {
+      activityType = isBmlt ? 'bmlt_mcq' : 'mcq';
+    }
+
+    if (activityId === undefined || pointsToAdd === undefined) {
+      return res.status(400).json({ error: 'Missing pointsToAdd or activity ID' });
     }
 
     try {
-      const student = await db.prepare('SELECT * FROM students WHERE id = ?').get(studentId) as any;
+      const student = db.prepare('SELECT * FROM students WHERE id = ?').get(studentId) as any;
       if (!student) {
         return res.status(404).json({ error: 'Student not found' });
       }
 
       let correctIds: number[] = [];
       let fieldName = 'correct_mcq_ids';
-      if (isBmlt) {
+      
+      if (activityType === 'bmlt_mcq') {
         correctIds = JSON.parse(student.correct_bmlt_mcq_ids || '[]');
         fieldName = 'correct_bmlt_mcq_ids';
+      } else if (activityType === 'bmlt_slide') {
+        correctIds = JSON.parse(student.correct_bmlt_slide_ids || '[]');
+        fieldName = 'correct_bmlt_slide_ids';
+      } else if (activityType === 'bmlt_case') {
+        correctIds = JSON.parse(student.correct_bmlt_case_ids || '[]');
+        fieldName = 'correct_bmlt_case_ids';
+      } else if (activityType === 'bmlt_case_paragraph') {
+        correctIds = JSON.parse(student.correct_bmlt_case_paragraph_ids || '[]');
+        fieldName = 'correct_bmlt_case_paragraph_ids';
       } else {
         correctIds = JSON.parse(student.correct_mcq_ids || '[]');
       }
 
       // Check if already answered
-      if (correctIds.includes(Number(mcqId))) {
+      if (correctIds.includes(Number(activityId))) {
         return res.json({ 
           success: true, 
           alreadyEarned: true, 
           points: student.points,
-          msg: 'Points already earned for this MCQ' 
+          msg: 'Points already earned for this activity' 
         });
       }
 
@@ -2694,7 +3720,7 @@ User's described mood: "${mood}"
       
       if (pointsDelta > 0) {
         // Only push to correctIds if they actually scored positive points (correct answer)
-        correctIds.push(Number(mcqId));
+        correctIds.push(Number(activityId));
         updatedPoints = student.points + pointsDelta;
       } else {
         // Incorrect attempt (deduction), do not mark as correctly answered
@@ -2706,15 +3732,18 @@ User's described mood: "${mood}"
         updatedPoints = 0;
       }
 
-      await db.prepare(`UPDATE students SET points = ?, ${fieldName} = ? WHERE id = ?`)
+      db.prepare(`UPDATE students SET points = ?, ${fieldName} = ? WHERE id = ?`)
         .run(updatedPoints, JSON.stringify(correctIds), studentId);
 
       res.json({
         success: true,
         alreadyEarned: false,
         points: updatedPoints,
-        correctMcqIds: isBmlt ? JSON.parse(student.correct_mcq_ids || '[]') : correctIds,
-        correctBmltMcqIds: isBmlt ? correctIds : JSON.parse(student.correct_bmlt_mcq_ids || '[]')
+        correctMcqIds: activityType === 'mcq' ? correctIds : JSON.parse(student.correct_mcq_ids || '[]'),
+        correctBmltMcqIds: activityType === 'bmlt_mcq' ? correctIds : JSON.parse(student.correct_bmlt_mcq_ids || '[]'),
+        correctBmltSlideIds: activityType === 'bmlt_slide' ? correctIds : JSON.parse(student.correct_bmlt_slide_ids || '[]'),
+        correctBmltCaseIds: activityType === 'bmlt_case' ? correctIds : JSON.parse(student.correct_bmlt_case_ids || '[]'),
+        correctBmltCaseParagraphIds: activityType === 'bmlt_case_paragraph' ? correctIds : JSON.parse(student.correct_bmlt_case_paragraph_ids || '[]')
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to record points' });
@@ -2723,27 +3752,27 @@ User's described mood: "${mood}"
 
 
   // ADMIN STUDENT MANAGEMENT ENDPOINTS (Authorized System Admins only)
-  app.get('/api/admin/students', requireAdminOnly, async (req, res) => {
+  app.get('/api/admin/students', requireAdminOnly, (req, res) => {
     try {
-      const students = await db.prepare('SELECT id, username, display_name, roll_no, reg_no, points, profile_pic, session, section, created_at FROM students').all();
+      const students = db.prepare('SELECT id, username, display_name, roll_no, reg_no, points, profile_pic, session, section, created_at FROM students').all();
       res.json(students);
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to retrieve students' });
     }
   });
 
-  app.post('/api/admin/students', requireAdminOnly, async (req, res) => {
+  app.post('/api/admin/students', requireAdminOnly, (req, res) => {
     const { username, password, display_name, roll_no, reg_no, session, section } = req.body;
     if (!username || !password || !display_name || !roll_no || !reg_no) {
       return res.status(400).json({ error: 'All fields (ID, Password, Name, Roll No, Reg No) are required' });
     }
     try {
       const hashedPassword = bcrypt.hashSync(password, 10);
-      const info = await db.prepare('INSERT INTO students (username, password, display_name, roll_no, reg_no, session, section) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      const info = db.prepare('INSERT INTO students (username, password, display_name, roll_no, reg_no, session, section) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(username, hashedPassword, display_name, roll_no, reg_no, session || '2023-2026', section || 'A');
       res.json({ success: true, id: info.lastInsertRowid });
     } catch (err: any) {
-      if ((err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === '23505')) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         res.status(400).json({ error: 'Roll No, Reg No, or Login ID already registered' });
       } else {
         res.status(500).json({ error: err.message || 'Server error creating student account' });
@@ -2751,11 +3780,11 @@ User's described mood: "${mood}"
     }
   });
 
-  app.put('/api/admin/students/:id', requireAdminOnly, async (req, res) => {
+  app.put('/api/admin/students/:id', requireAdminOnly, (req, res) => {
     const { username, password, display_name, roll_no, reg_no, points, session, section } = req.body;
     const studentId = req.params.id;
     try {
-      const existing = await db.prepare('SELECT password FROM students WHERE id = ?').get(studentId) as any;
+      const existing = db.prepare('SELECT password FROM students WHERE id = ?').get(studentId) as any;
       if (!existing) {
         return res.status(404).json({ error: 'Student not found' });
       }
@@ -2765,7 +3794,7 @@ User's described mood: "${mood}"
         activePassword = bcrypt.hashSync(password, 10);
       }
 
-      await db.prepare(`
+      db.prepare(`
         UPDATE students 
         SET username = COALESCE(?, username), 
             password = ?, 
@@ -2780,7 +3809,7 @@ User's described mood: "${mood}"
 
       res.json({ success: true });
     } catch (err: any) {
-      if ((err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === '23505')) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         res.status(400).json({ error: 'Roll No, Reg No, or Login ID already registered to another account' });
       } else {
         res.status(500).json({ error: err.message || 'Failed to update student account' });
@@ -2788,9 +3817,9 @@ User's described mood: "${mood}"
     }
   });
 
-  app.delete('/api/admin/students/:id', requireAdminOnly, async (req, res) => {
+  app.delete('/api/admin/students/:id', requireAdminOnly, (req, res) => {
     try {
-      await db.prepare('DELETE FROM students WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM students WHERE id = ?').run(req.params.id);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete student' });
@@ -2798,25 +3827,25 @@ User's described mood: "${mood}"
   });
 
   // ADMIN ACADEMIC SESSIONS ENDPOINTS
-  app.get('/api/admin/sessions', async (req, res) => {
+  app.get('/api/admin/sessions', (req, res) => {
     try {
-      const sessions = await db.prepare('SELECT id, name FROM academic_sessions ORDER BY name ASC').all();
+      const sessions = db.prepare('SELECT id, name FROM academic_sessions ORDER BY name ASC').all();
       res.json(sessions);
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to retrieve academic sessions' });
     }
   });
 
-  app.post('/api/admin/sessions', requireAdminOnly, async (req, res) => {
+  app.post('/api/admin/sessions', requireAdminOnly, (req, res) => {
     const { name } = req.body;
     if (!name || name.trim() === '') {
       return res.status(400).json({ error: 'Session name is required' });
     }
     try {
-      const info = await db.prepare('INSERT INTO academic_sessions (name) VALUES (?)').run(name.trim());
+      const info = db.prepare('INSERT INTO academic_sessions (name) VALUES (?)').run(name.trim());
       res.json({ success: true, id: info.lastInsertRowid, name: name.trim() });
     } catch (err: any) {
-      if ((err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === '23505')) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         res.status(400).json({ error: 'Session already exists' });
       } else {
         res.status(500).json({ error: err.message || 'Failed to create academic session' });
@@ -2824,17 +3853,17 @@ User's described mood: "${mood}"
     }
   });
 
-  app.put('/api/admin/sessions/:id', requireAdminOnly, async (req, res) => {
+  app.put('/api/admin/sessions/:id', requireAdminOnly, (req, res) => {
     const { name } = req.body;
     const sessionId = req.params.id;
     if (!name || name.trim() === '') {
       return res.status(400).json({ error: 'Session name is required' });
     }
     try {
-      await db.prepare('UPDATE academic_sessions SET name = ? WHERE id = ?').run(name.trim(), sessionId);
+      db.prepare('UPDATE academic_sessions SET name = ? WHERE id = ?').run(name.trim(), sessionId);
       res.json({ success: true, id: Number(sessionId), name: name.trim() });
     } catch (err: any) {
-      if ((err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === '23505')) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         res.status(400).json({ error: 'Session name already exists' });
       } else {
         res.status(500).json({ error: err.message || 'Failed to update academic session' });
@@ -2842,23 +3871,14 @@ User's described mood: "${mood}"
     }
   });
 
-  app.delete('/api/admin/sessions/:id', requireAdminOnly, async (req, res) => {
+  app.delete('/api/admin/sessions/:id', requireAdminOnly, (req, res) => {
     const sessionId = req.params.id;
     try {
-      await db.prepare('DELETE FROM academic_sessions WHERE id = ?').run(sessionId);
+      db.prepare('DELETE FROM academic_sessions WHERE id = ?').run(sessionId);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to delete academic session' });
     }
-  });
-
-  // Database Backup and Restore Endpoints
-  app.get('/api/admin/backup-db', requireAdminOnly, async (req, res) => {
-    res.status(400).json({ error: 'Database is hosted on Supabase Postgres. Please use the Supabase Dashboard to export or manage backups.' });
-  });
-
-  app.post('/api/admin/restore-db', requireAdminOnly, upload.single('file'), async (req, res) => {
-    res.status(400).json({ error: 'Database is hosted on Supabase Postgres. Please use the Supabase Dashboard SQL Editor or Import tool to restore data.' });
   });
 
   // Vite middleware for development
@@ -2874,14 +3894,14 @@ User's described mood: "${mood}"
       console.warn('Vite dev server could not be loaded dynamically. Falling back to static assets serving.', e?.message || e);
       const distPath = path.join(process.cwd(), 'dist');
       app.use(express.static(distPath));
-      app.get('*', async (req, res) => {
+      app.get('*', (req, res) => {
         res.sendFile(path.join(distPath, 'index.html'));
       });
     }
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', async (req, res) => {
+    app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -2973,4 +3993,3 @@ function getProceduralFallbackResponse(mood: string) {
     }))
   };
 }
-
